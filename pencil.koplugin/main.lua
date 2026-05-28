@@ -81,6 +81,21 @@ local function multiplyRectHL(bb, x, y, w, h, color)
     end
 end
 
+-- Stamp a single point centred on (x, y) at the given width. Pen uses
+-- paintRectRGB32 (solid fill); highlighter uses multiplyRectHL (multiply
+-- blend over existing pixels). Single-sources the "highlighter uses
+-- multiply, pen uses solid" branch that was previously duplicated across
+-- four stamping sites (addRawPoint n==1, onDrawPan n==1, onDrawPan fallback
+-- start-stamp, renderStroke single-point, renderStroke p0 stamp).
+local function stampPoint(bb, x, y, width, color, is_highlighter)
+    local half_w = math.floor(width / 2)
+    if is_highlighter then
+        multiplyRectHL(bb, x - half_w, y - half_w, width, width, color)
+    else
+        bb:paintRectRGB32(x - half_w, y - half_w, width, width, color)
+    end
+end
+
 -- Annotation grouping constants
 local GROUP_TIME_THRESHOLD_S = 10   -- seconds between strokes to be grouped
 local GROUP_SPATIAL_THRESHOLD = 200 -- pixels between bboxes to be grouped
@@ -446,21 +461,14 @@ function Pencil:handleStylusSlot(input, slot)
     -- behavior is unreachable on Kobo (no slot updates without pen contact)
     -- and remains gated on the keypath for devices where it does fire.
     --
-    -- IMPORTANT: gate clearing on side_button_set_by_slot. On keypath devices
-    -- (PR #65), onStylusButtonPress sets side_button_down = true; subsequent
-    -- pen-down slot events arrive with slot.tool == TOOL_TYPE_PEN. Without the
-    -- guard, the elif would unconditionally clear side_button_down on every
-    -- pen-down sample, silently disabling PR #65's highlight-on-hold and
-    -- quick-tap-toggle gestures. Only the slot path may clear what the slot
-    -- path set; the key path owns its own clearing via onStylusButtonRelease.
+    -- Both writers (this slot path, and onStylusButtonPress/Release on the
+    -- keypath) funnel through setSideButtonDown which embeds the source-aware
+    -- precedence rule: slot writes never clobber state the key path set.
     local highlighter_slot_tool = self.swap_eraser_and_highlighter and TOOL_TYPE_ERASER or TOOL_TYPE_HIGHLIGHTER
     if slot.tool == highlighter_slot_tool then
-        self.side_button_down = true
-        self.side_button_set_by_slot = true
-    elseif self.side_button_set_by_slot then
-        self.side_button_down = false
-        self.side_button_used_for_highlight = false
-        self.side_button_set_by_slot = false
+        self:setSideButtonDown(true, "slot")
+    else
+        self:setSideButtonDown(false, "slot")
     end
 
     -- Eraser mode (from eraser end or hardware button) - works even if pencil disabled
@@ -736,12 +744,8 @@ function Pencil:addRawPoint(x, y)
     -- color and dark text stays dark — visually equivalent to "behind text".
     local dirty_x, dirty_y, dirty_w, dirty_h
     if n == 1 then
-        local half_w_draw = math.floor(width / 2)
-        if self.current_stroke.tool == TOOL_HIGHLIGHTER then
-            multiplyRectHL(Screen.bb, x - half_w_draw, y - half_w_draw, width, width, color)
-        else
-            Screen.bb:paintRectRGB32(x - half_w_draw, y - half_w_draw, width, width, color)
-        end
+        stampPoint(Screen.bb, x, y, width, color,
+            self.current_stroke.tool == TOOL_HIGHLIGHTER)
         -- Use slightly larger dirty region for refresh padding
         dirty_x = x - half_w
         dirty_y = y - half_w
@@ -1105,17 +1109,16 @@ function Pencil:loadSettings()
     self.experimental_pen_width = settings.experimental_pen_width or false
     self.experimental_color_picker = settings.experimental_color_picker or false
     self.experimental_text_highlight = settings.experimental_text_highlight or false
-    -- Load pen color by name and look up the actual color value
-    local color_name = settings.pen_color_name
-    if color_name then
-        self.tool_settings[TOOL_PEN].color_name = color_name
-        for _, color_info in ipairs(self.available_colors) do
-            if color_info.name == color_name then
-                self.tool_settings[TOOL_PEN].color = color_info.color
-                break
-            end
-        end
-    end
+    -- Load saved pen and highlighter colors. Both go through the shared
+    -- validator (review Issue 10) so the validation policy is single-sourced:
+    -- the name is only assigned when it matches a palette entry. A malformed
+    -- or stale settings value (palette renamed across versions, settings
+    -- tampered, fresh install reading old settings) falls back to init
+    -- defaults rather than persisting an unrecognized name.
+    self:loadToolColorByName(TOOL_PEN, settings.pen_color_name, self.available_colors)
+    self:loadToolColorByName(TOOL_HIGHLIGHTER, settings.highlighter_color_name,
+        self.available_highlighter_colors)
+
     -- Load pen width if previously chosen via the experimental width picker.
     -- Validated against available_widths so a malformed settings file can't
     -- inject arbitrary widths.
@@ -1128,18 +1131,22 @@ function Pencil:loadSettings()
             end
         end
     end
-    -- Load highlighter color by name. Validated against the highlighter
-    -- palette so the alpha-baked color value is always the canonical one.
-    local hl_color_name = settings.highlighter_color_name
-    if hl_color_name then
-        for _, color_info in ipairs(self.available_highlighter_colors) do
-            if color_info.name == hl_color_name then
-                self.tool_settings[TOOL_HIGHLIGHTER].color = color_info.color
-                self.tool_settings[TOOL_HIGHLIGHTER].color_name = hl_color_name
-                break
-            end
+end
+
+-- Validate and apply a saved color name against the tool's palette. Single
+-- validation policy for both pen and highlighter loaders (review Issue 10).
+-- On match: assigns both color and color_name to tool_settings[tool], returns
+-- true. On nil or no-match: leaves init defaults intact, returns false.
+function Pencil:loadToolColorByName(tool, color_name, palette)
+    if not color_name then return false end
+    for _, color_info in ipairs(palette) do
+        if color_info.name == color_name then
+            self.tool_settings[tool].color = color_info.color
+            self.tool_settings[tool].color_name = color_name
+            return true
         end
     end
+    return false
 end
 
 -- Save plugin settings
@@ -1256,11 +1263,9 @@ function Pencil:addToMainMenu(menu_items)
                                 return self.tool_settings[TOOL_HIGHLIGHTER].color_name == name
                             end,
                             callback = function()
+                                -- setHighlighterColor emits its own
+                                -- "Highlighter: %1" InfoMessage (Issue 12).
                                 self:setHighlighterColor(color, name)
-                                UIManager:show(InfoMessage:new{
-                                    text = T(_("Highlighter: %1"), name),
-                                    timeout = 1,
-                                })
                             end,
                         })
                     end
@@ -1520,6 +1525,40 @@ Pages with strokes:%8]]),
     })
 end
 
+-- Single mutator for side_button_down (review Issue 7). Two writers exist:
+--   * slot.tool transitions in handleStylusSlot (the only signal on Kobo,
+--     where BTN_STYLUS2 is consumed by the stylus-callback domination path
+--     and never surfaces as a key event).
+--   * BTN_STYLUS2 key events via onStylusButtonPress/Release (keypath
+--     devices targeted by PR #65).
+-- Precedence rule: the slot path may only clear state that the slot path
+-- itself set. A pen-down sample (slot.tool == TOOL_TYPE_PEN) on a keypath
+-- device must not clobber the side_button_down that onStylusButtonPress
+-- just raised. The key path always wins — including taking ownership of
+-- state previously set by the slot path on the same device.
+function Pencil:setSideButtonDown(down, source)
+    if down then
+        self.side_button_down = true
+        -- Track ownership: "slot" arms the precedence guard; "key" overrides
+        -- and clears any prior slot marker so the key path now owns release.
+        self._side_button_set_by_slot = (source == "slot")
+        if source == "key" then
+            -- Key press starts a fresh gesture cycle; reset the "used for
+            -- highlight" marker so onStylusButtonRelease can decide quick-
+            -- tap-toggle vs hold-to-highlight correctly.
+            self.side_button_used_for_highlight = false
+        end
+    else
+        if source == "slot" and not self._side_button_set_by_slot then
+            -- Slot can only clear what it set; bail to preserve key state.
+            return
+        end
+        self.side_button_down = false
+        self.side_button_used_for_highlight = false
+        self._side_button_set_by_slot = false
+    end
+end
+
 -- Handle stylus button press (down event)
 -- Side button behavior:
 --   - Hold + drag = temporarily highlight, then return to original tool
@@ -1527,8 +1566,7 @@ end
 function Pencil:onStylusButtonPress()
     if not self:isEnabled() or self:isOverlayActive() then return false end
 
-    self.side_button_down = true
-    self.side_button_used_for_highlight = false
+    self:setSideButtonDown(true, "key")
 
     logger.dbg("Pencil: side button pressed")
     return true
@@ -1538,12 +1576,16 @@ end
 function Pencil:onStylusButtonRelease()
     if not self:isEnabled() or self:isOverlayActive() then return false end
 
+    -- Snapshot the decision inputs BEFORE the mutator clears them — the
+    -- quick-tap-toggle branch needs both "was held down" and "did not
+    -- highlight during the hold" from the pre-release state.
     local was_down = self.side_button_down
-    self.side_button_down = false
+    local was_used_for_highlight = self.side_button_used_for_highlight
+    self:setSideButtonDown(false, "key")
 
     -- If the button was NOT used for highlighting (no drawing while held),
     -- treat it as a quick press to toggle between pen and eraser
-    if was_down and not self.side_button_used_for_highlight then
+    if was_down and not was_used_for_highlight then
         logger.dbg("Pencil: side button quick press - toggling pen/eraser")
         self:togglePenEraser()
     else
@@ -1551,7 +1593,6 @@ function Pencil:onStylusButtonRelease()
         logger.dbg("Pencil: highlight complete, back to", self.current_tool)
     end
 
-    self.side_button_used_for_highlight = false
     return true
 end
 
@@ -2465,11 +2506,9 @@ function Pencil:showColorPicker(x, y)
             end
 
             if highlighter_mode then
+                -- setHighlighterColor emits its own "Highlighter: %1"
+                -- InfoMessage (Issue 12).
                 plugin:setHighlighterColor(color_value, color_name)
-                UIManager:show(InfoMessage:new{
-                    text = T(_("Highlighter: %1"), color_name),
-                    timeout = 1,
-                })
                 return
             end
 
@@ -2524,6 +2563,15 @@ function Pencil:setHighlighterColor(color, color_name)
     self.tool_settings[TOOL_HIGHLIGHTER].color_name = color_name
     logger.info("Pencil: setHighlighterColor - color_name =", color_name)
     self:saveSettings()
+    -- Surface the change to the user (review Issue 12). Folded in here so
+    -- the menu sub-item callback and the color picker callback don't each
+    -- repeat the byte-identical InfoMessage; this matches the function's
+    -- existing shape (logger.info + saveSettings) by treating user-visible
+    -- feedback as part of "applying" a new highlighter color.
+    UIManager:show(InfoMessage:new{
+        text = T(_("Highlighter: %1"), color_name),
+        timeout = 1,
+    })
 end
 
 -- Set pen width. Only callable while experimental_pen_width is on
@@ -2798,10 +2846,8 @@ function Pencil:onDrawPan(ges)
             -- a fallback stroke. Pen has no exclude-start contract (its
             -- drawLineSegment loops from i=0), so it does not need this.
             if effective_tool == TOOL_HIGHLIGHTER then
-                local hl_half_w = math.floor(tool_settings.width / 2)
-                multiplyRectHL(Screen.bb,
-                    ges.start_pos.x - hl_half_w, ges.start_pos.y - hl_half_w,
-                    tool_settings.width, tool_settings.width, tool_settings.color)
+                stampPoint(Screen.bb, ges.start_pos.x, ges.start_pos.y,
+                    tool_settings.width, tool_settings.color, true)
             end
         end
     end
@@ -2831,12 +2877,8 @@ function Pencil:onDrawPan(ges)
         end
     elseif n == 1 then
         local p = self.current_stroke.points[1]
-        local half_w = math.floor(width / 2)
-        if effective_tool == TOOL_HIGHLIGHTER then
-            multiplyRectHL(Screen.bb, p.x - half_w, p.y - half_w, width, width, color)
-        else
-            Screen.bb:paintRectRGB32(p.x - half_w, p.y - half_w, width, width, color)
-        end
+        stampPoint(Screen.bb, p.x, p.y, width, color,
+            effective_tool == TOOL_HIGHLIGHTER)
     end
 
     return true
@@ -3902,7 +3944,11 @@ function Pencil:drawHighlighterSegment(bb, x1, y1, x2, y2, width, color, include
     local dy = y2 - y1
     local dist = math.sqrt(dx * dx + dy * dy)
 
-    local highlight_color = color or Blitbuffer.ColorRGB32(0xFF, 0xF5, 0x9D, 0xFF)
+    -- Fall back to the configured highlighter color (palette source of truth)
+    -- rather than re-literalising the Yellow RGB triplet here. Keeps the
+    -- "what's the default highlighter colour" answer in one place — the
+    -- available_highlighter_colors palette set up in init() (review Issue 11).
+    local highlight_color = color or self.tool_settings[TOOL_HIGHLIGHTER].color
     local half_w = math.floor(width / 2)
 
     if include_start then
@@ -4026,21 +4072,16 @@ function Pencil:renderStroke(bb, stroke)
     if #stroke.points == 1 then
         -- Single point (dot)
         local p = stroke.points[1]
-        local half_w = math.floor(width / 2)
-        if is_highlighter then
-            multiplyRectHL(bb, p.x - half_w, p.y - half_w, width, width, color)
-        else
-            bb:paintRectRGB32(p.x - half_w, p.y - half_w, width, width, color)
-        end
+        stampPoint(bb, p.x, p.y, width, color, is_highlighter)
     else
-        -- Multi-point stroke. drawHighlighterSegment skips the start point
-        -- (to avoid double-stamping shared endpoints between consecutive
-        -- segments, which compound-darkens slow strokes), so for the very
-        -- first point of the stroke we must stamp it ourselves once here.
+        -- Multi-point stroke. drawHighlighterSegment is called with
+        -- include_start=false in the loop below (to avoid double-stamping
+        -- shared endpoints between consecutive segments, which compound-
+        -- darkens slow strokes), so for the very first point of the stroke
+        -- we must stamp it ourselves once here.
         if is_highlighter then
             local p0 = stroke.points[1]
-            local half_w = math.floor(width / 2)
-            multiplyRectHL(bb, p0.x - half_w, p0.y - half_w, width, width, color)
+            stampPoint(bb, p0.x, p0.y, width, color, true)
         end
         for i = 2, #stroke.points do
             local p1 = stroke.points[i - 1]

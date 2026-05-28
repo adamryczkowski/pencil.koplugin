@@ -166,10 +166,13 @@ local function createMockPencil(options)
     end
 
     -- Set highlighter color (mirrors main.lua Pencil:setHighlighterColor).
+    -- Issue 12 folded the user-feedback InfoMessage into the setter; mirror
+    -- it via the _notification_shown tracking field.
     function mock:setHighlighterColor(color, color_name)
         self.tool_settings[TOOL_HIGHLIGHTER].color = color
         self.tool_settings[TOOL_HIGHLIGHTER].color_name = color_name
         self._saved = true  -- main.lua calls saveSettings()
+        self._notification_shown = { text = "Highlighter: " .. tostring(color_name) }
     end
 
     -- Look up a highlighter color by name
