@@ -95,7 +95,21 @@ local function createMockPencil(options)
 
     -- Initialize colors (simulating init())
     mock.tool_settings[TOOL_PEN].color = MockBlitbuffer.COLOR_BLACK
-    mock.tool_settings[TOOL_HIGHLIGHTER].color = MockBlitbuffer.Color8(0xDD)
+
+    -- Highlighter palette: pale base hues. Rendering uses multiply blending,
+    -- which computes result = src * dst / 255 per channel. With very light
+    -- source colors the white bg ≈ shows through and dark text stays readable.
+    -- Mirrors main.lua's available_highlighter_colors / init() defaults.
+    mock.available_highlighter_colors = {
+        { name = "Yellow", color = MockBlitbuffer.ColorRGB32(0xFF, 0xF5, 0x9D, 0xFF) },
+        { name = "Green",  color = MockBlitbuffer.ColorRGB32(0xC8, 0xE6, 0xC9, 0xFF) },
+        { name = "Pink",   color = MockBlitbuffer.ColorRGB32(0xF8, 0xBB, 0xD0, 0xFF) },
+        { name = "Cyan",   color = MockBlitbuffer.ColorRGB32(0xB3, 0xE5, 0xFC, 0xFF) },
+        { name = "Orange", color = MockBlitbuffer.ColorRGB32(0xFF, 0xCC, 0x80, 0xFF) },
+    }
+    -- Default highlighter is Yellow (matches main.lua:200-201).
+    mock.tool_settings[TOOL_HIGHLIGHTER].color = mock.available_highlighter_colors[1].color
+    mock.tool_settings[TOOL_HIGHLIGHTER].color_name = mock.available_highlighter_colors[1].name
 
     mock.available_colors = {
         { name = "Black", color = MockBlitbuffer.COLOR_BLACK },
@@ -149,6 +163,23 @@ local function createMockPencil(options)
     function mock:setPenColor(color, color_name)
         self.tool_settings[TOOL_PEN].color = color
         self.tool_settings[TOOL_PEN].color_name = color_name
+    end
+
+    -- Set highlighter color (mirrors main.lua Pencil:setHighlighterColor).
+    function mock:setHighlighterColor(color, color_name)
+        self.tool_settings[TOOL_HIGHLIGHTER].color = color
+        self.tool_settings[TOOL_HIGHLIGHTER].color_name = color_name
+        self._saved = true  -- main.lua calls saveSettings()
+    end
+
+    -- Look up a highlighter color by name
+    function mock:getHighlighterColorByName(color_name)
+        for _, color_info in ipairs(self.available_highlighter_colors) do
+            if color_info.name == color_name then
+                return color_info.color
+            end
+        end
+        return nil
     end
 
     -- Get color by name
@@ -273,6 +304,30 @@ local function createMockPencil(options)
         return false
     end
 
+    -- Load highlighter color by name (mirrors main.lua:1093-1104 loader:
+    -- iterate the palette; on match, assign color AND color_name; on
+    -- no-match, leave both at their init defaults).
+    function mock:loadHighlighterColorByName(color_name)
+        if not color_name then return false end
+        for _, color_info in ipairs(self.available_highlighter_colors) do
+            if color_info.name == color_name then
+                self.tool_settings[TOOL_HIGHLIGHTER].color = color_info.color
+                self.tool_settings[TOOL_HIGHLIGHTER].color_name = color_name
+                return true
+            end
+        end
+        return false
+    end
+
+    -- Mirror of main.lua's saveSettings persistence shape — only the
+    -- fields that round-trip through highlighter_color_name are modeled.
+    function mock:simulateSaveSettings()
+        return {
+            pen_color_name = self.tool_settings[TOOL_PEN].color_name,
+            highlighter_color_name = self.tool_settings[TOOL_HIGHLIGHTER].color_name,
+        }
+    end
+
     -- Create stroke with current color
     function mock:createStrokeWithCurrentColor(page, points)
         local tool_settings = self.tool_settings[self.current_tool]
@@ -357,10 +412,18 @@ describe("pen color functionality", function()
             assert.is_not_nil(pencil.tool_settings[TOOL_PEN].color)
         end)
 
-        it("sets highlighter to light gray", function()
+        it("sets highlighter to Yellow (ColorRGB32) by default", function()
+            -- main.lua's init() now sets highlighter to available_highlighter_colors[1]
+            -- (Yellow, ColorRGB32 0xFF/0xF5/0x9D/0xFF) instead of the prior Color8(0xDD)
+            -- light-gray. The mock previously hard-coded the stale default and the
+            -- assertion silently asserted the removed behaviour; both are now updated.
             local pencil = createMockPencil()
             assert.is_not_nil(pencil.tool_settings[TOOL_HIGHLIGHTER].color)
-            assert.equals("gray", pencil.tool_settings[TOOL_HIGHLIGHTER].color.type)
+            assert.equals("rgb32", pencil.tool_settings[TOOL_HIGHLIGHTER].color.type)
+            assert.equals("Yellow", pencil.tool_settings[TOOL_HIGHLIGHTER].color_name)
+            assert.equals(0xFF, pencil.tool_settings[TOOL_HIGHLIGHTER].color.r)
+            assert.equals(0xF5, pencil.tool_settings[TOOL_HIGHLIGHTER].color.g)
+            assert.equals(0x9D, pencil.tool_settings[TOOL_HIGHLIGHTER].color.b)
         end)
 
     end)
@@ -762,6 +825,268 @@ describe("color persistence", function()
         local success = pencil:loadPenColorByName(nil)
 
         assert.is_false(success)
+    end)
+
+end)
+
+
+-- ---------------------------------------------------------------------------
+-- Highlighter color API (parallel to pen color tests above).
+-- Added to cover the Goal 1 surface introduced by the color-and-highlight-button
+-- MR: setHighlighterColor, the 5-color available_highlighter_colors palette,
+-- highlighter_color_name settings round-trip, and the multiplyRectHL primitive.
+-- ---------------------------------------------------------------------------
+
+describe("highlighter color functionality", function()
+
+    describe("available_highlighter_colors palette", function()
+
+        it("initializes with 5 highlighter colors", function()
+            local pencil = createMockPencil()
+            assert.equals(5, #pencil.available_highlighter_colors)
+        end)
+
+        it("includes the documented palette names in order", function()
+            local pencil = createMockPencil()
+            local names = {}
+            for _, c in ipairs(pencil.available_highlighter_colors) do
+                table.insert(names, c.name)
+            end
+            assert.same({ "Yellow", "Green", "Pink", "Cyan", "Orange" }, names)
+        end)
+
+        it("every palette entry is a ColorRGB32 value", function()
+            -- The multiply primitive operates on RGB32; Color8 entries would
+            -- silently downgrade the highlighter to luminance overwrite.
+            local pencil = createMockPencil()
+            for _, c in ipairs(pencil.available_highlighter_colors) do
+                assert.equals("rgb32", c.color.type,
+                    "highlighter palette entry " .. c.name .. " is not rgb32")
+                assert.equals(0xFF, c.color.a,
+                    "highlighter palette entry " .. c.name .. " is not fully opaque")
+            end
+        end)
+
+    end)
+
+    describe("setHighlighterColor", function()
+
+        it("sets both color and color_name", function()
+            local pencil = createMockPencil()
+            local green = pencil.available_highlighter_colors[2].color
+
+            pencil:setHighlighterColor(green, "Green")
+
+            assert.equals("Green", pencil.tool_settings[TOOL_HIGHLIGHTER].color_name)
+            assert.equals(green, pencil.tool_settings[TOOL_HIGHLIGHTER].color)
+        end)
+
+        it("can change color multiple times", function()
+            local pencil = createMockPencil()
+
+            pencil:setHighlighterColor(pencil.available_highlighter_colors[3].color, "Pink")
+            assert.equals("Pink", pencil.tool_settings[TOOL_HIGHLIGHTER].color_name)
+
+            pencil:setHighlighterColor(pencil.available_highlighter_colors[4].color, "Cyan")
+            assert.equals("Cyan", pencil.tool_settings[TOOL_HIGHLIGHTER].color_name)
+        end)
+
+        it("does not mutate pen state", function()
+            -- Highlighter and pen state are independent; changing one
+            -- must not bleed into the other.
+            local pencil = createMockPencil()
+            local original_pen_name = pencil.tool_settings[TOOL_PEN].color_name
+            local original_pen_color = pencil.tool_settings[TOOL_PEN].color
+
+            pencil:setHighlighterColor(
+                pencil.available_highlighter_colors[2].color, "Green")
+
+            assert.equals(original_pen_name, pencil.tool_settings[TOOL_PEN].color_name)
+            assert.equals(original_pen_color, pencil.tool_settings[TOOL_PEN].color)
+        end)
+
+    end)
+
+    describe("getHighlighterColorByName", function()
+
+        it("returns correct color for valid name", function()
+            local pencil = createMockPencil()
+
+            local cyan = pencil:getHighlighterColorByName("Cyan")
+
+            assert.is_not_nil(cyan)
+            assert.equals("rgb32", cyan.type)
+            assert.equals(0xB3, cyan.r)
+            assert.equals(0xE5, cyan.g)
+            assert.equals(0xFC, cyan.b)
+        end)
+
+        it("returns nil for unknown highlighter color name", function()
+            local pencil = createMockPencil()
+
+            local unknown = pencil:getHighlighterColorByName("Magenta")
+
+            assert.is_nil(unknown)
+        end)
+
+    end)
+
+    describe("highlighter_color_name persistence round-trip", function()
+
+        it("saveSettings emits the current highlighter_color_name", function()
+            local pencil = createMockPencil()
+            pencil:setHighlighterColor(
+                pencil.available_highlighter_colors[5].color, "Orange")
+
+            local saved = pencil:simulateSaveSettings()
+
+            assert.equals("Orange", saved.highlighter_color_name)
+        end)
+
+        it("loadHighlighterColorByName restores a saved color", function()
+            local pencil = createMockPencil()
+            -- Default is Yellow; load Pink and verify both fields move.
+            local ok = pencil:loadHighlighterColorByName("Pink")
+
+            assert.is_true(ok)
+            assert.equals("Pink", pencil.tool_settings[TOOL_HIGHLIGHTER].color_name)
+            assert.equals(
+                pencil.available_highlighter_colors[3].color,
+                pencil.tool_settings[TOOL_HIGHLIGHTER].color)
+        end)
+
+        it("round-trips save → load with no data loss", function()
+            -- Pick a non-default color, save, simulate a fresh pencil, load.
+            local pencil_a = createMockPencil()
+            pencil_a:setHighlighterColor(
+                pencil_a.available_highlighter_colors[4].color, "Cyan")
+            local saved = pencil_a:simulateSaveSettings()
+
+            local pencil_b = createMockPencil()
+            local ok = pencil_b:loadHighlighterColorByName(saved.highlighter_color_name)
+
+            assert.is_true(ok)
+            assert.equals("Cyan", pencil_b.tool_settings[TOOL_HIGHLIGHTER].color_name)
+            assert.equals(0xB3, pencil_b.tool_settings[TOOL_HIGHLIGHTER].color.r)
+            assert.equals(0xE5, pencil_b.tool_settings[TOOL_HIGHLIGHTER].color.g)
+            assert.equals(0xFC, pencil_b.tool_settings[TOOL_HIGHLIGHTER].color.b)
+        end)
+
+        it("loadHighlighterColorByName returns false for unknown name", function()
+            local pencil = createMockPencil()
+
+            local ok = pencil:loadHighlighterColorByName("NotARealPaletteEntry")
+
+            assert.is_false(ok)
+            -- On no-match, init defaults (Yellow) are preserved.
+            assert.equals("Yellow", pencil.tool_settings[TOOL_HIGHLIGHTER].color_name)
+        end)
+
+        it("loadHighlighterColorByName returns false for nil name", function()
+            local pencil = createMockPencil()
+
+            local ok = pencil:loadHighlighterColorByName(nil)
+
+            assert.is_false(ok)
+            assert.equals("Yellow", pencil.tool_settings[TOOL_HIGHLIGHTER].color_name)
+        end)
+
+    end)
+
+end)
+
+
+-- ---------------------------------------------------------------------------
+-- multiplyRectHL primitive (main.lua:52-58).
+-- The helper picks the host blitbuffer's fast-path: rect-multiply if
+-- multiplyRectRGB is available (modern KOReader-base), else paintRect with
+-- the setPixelMultiply per-pixel setter (older builds, e.g. Snowflake).
+-- These tests verify dispatch against both shapes of mock blitbuffer.
+-- ---------------------------------------------------------------------------
+
+describe("multiplyRectHL primitive", function()
+
+    -- Local mirror of main.lua's file-local function. Re-implemented in the
+    -- spec (mirroring the project's existing pattern — see buildPickerRows,
+    -- loadPenColorByName, etc.) because the helper is not exported.
+    local function multiplyRectHL(bb, x, y, w, h, color)
+        if bb.multiplyRectRGB then
+            bb:multiplyRectRGB(x, y, w, h, color)
+        else
+            bb:paintRect(x, y, w, h, color, bb.setPixelMultiply)
+        end
+    end
+
+    local function makeBBWithMultiplyRect()
+        local bb = { calls = {} }
+        function bb:multiplyRectRGB(x, y, w, h, color)
+            table.insert(self.calls, {
+                method = "multiplyRectRGB", x = x, y = y, w = w, h = h, color = color,
+            })
+        end
+        function bb:paintRect(x, y, w, h, color, setter)
+            table.insert(self.calls, {
+                method = "paintRect", x = x, y = y, w = w, h = h, color = color, setter = setter,
+            })
+        end
+        function bb:setPixelMultiply(x, y, color) end
+        return bb
+    end
+
+    local function makeBBWithoutMultiplyRect()
+        local bb = { calls = {} }
+        -- No multiplyRectRGB — simulates older builds (e.g. Snowflake).
+        function bb:paintRect(x, y, w, h, color, setter)
+            table.insert(self.calls, {
+                method = "paintRect", x = x, y = y, w = w, h = h, color = color, setter = setter,
+            })
+        end
+        function bb:setPixelMultiply(x, y, color) end
+        return bb
+    end
+
+    it("dispatches to multiplyRectRGB when available", function()
+        local bb = makeBBWithMultiplyRect()
+        local color = MockBlitbuffer.ColorRGB32(0xFF, 0xF5, 0x9D, 0xFF)
+
+        multiplyRectHL(bb, 10, 20, 30, 40, color)
+
+        assert.equals(1, #bb.calls)
+        assert.equals("multiplyRectRGB", bb.calls[1].method)
+        assert.equals(10, bb.calls[1].x)
+        assert.equals(20, bb.calls[1].y)
+        assert.equals(30, bb.calls[1].w)
+        assert.equals(40, bb.calls[1].h)
+        assert.equals(color, bb.calls[1].color)
+    end)
+
+    it("falls back to paintRect with setPixelMultiply when multiplyRectRGB is absent", function()
+        local bb = makeBBWithoutMultiplyRect()
+        local color = MockBlitbuffer.ColorRGB32(0xC8, 0xE6, 0xC9, 0xFF)
+
+        multiplyRectHL(bb, 5, 6, 7, 8, color)
+
+        assert.equals(1, #bb.calls)
+        assert.equals("paintRect", bb.calls[1].method)
+        assert.equals(5, bb.calls[1].x)
+        assert.equals(6, bb.calls[1].y)
+        assert.equals(7, bb.calls[1].w)
+        assert.equals(8, bb.calls[1].h)
+        assert.equals(color, bb.calls[1].color)
+        -- The custom setter is the multiply per-pixel function.
+        assert.equals(bb.setPixelMultiply, bb.calls[1].setter)
+    end)
+
+    it("does not call paintRect when multiplyRectRGB is available", function()
+        -- Guards the dispatch order: the fast-path must win over the fallback.
+        local bb = makeBBWithMultiplyRect()
+
+        multiplyRectHL(bb, 0, 0, 1, 1,
+            MockBlitbuffer.ColorRGB32(0xFF, 0xF5, 0x9D, 0xFF))
+
+        for _, call in ipairs(bb.calls) do
+            assert.not_equals("paintRect", call.method)
+        end
     end)
 
 end)
