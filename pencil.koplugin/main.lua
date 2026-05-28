@@ -419,12 +419,22 @@ function Pencil:handleStylusSlot(input, slot)
     -- highlighter tool. The "tap to toggle pen/eraser" half of the side-button
     -- behavior is unreachable on Kobo (no slot updates without pen contact)
     -- and remains gated on the keypath for devices where it does fire.
+    --
+    -- IMPORTANT: gate clearing on side_button_set_by_slot. On keypath devices
+    -- (PR #65), onStylusButtonPress sets side_button_down = true; subsequent
+    -- pen-down slot events arrive with slot.tool == TOOL_TYPE_PEN. Without the
+    -- guard, the elif would unconditionally clear side_button_down on every
+    -- pen-down sample, silently disabling PR #65's highlight-on-hold and
+    -- quick-tap-toggle gestures. Only the slot path may clear what the slot
+    -- path set; the key path owns its own clearing via onStylusButtonRelease.
     local highlighter_slot_tool = self.swap_eraser_and_highlighter and TOOL_TYPE_ERASER or TOOL_TYPE_HIGHLIGHTER
     if slot.tool == highlighter_slot_tool then
         self.side_button_down = true
-    elseif self.side_button_down then
+        self.side_button_set_by_slot = true
+    elseif self.side_button_set_by_slot then
         self.side_button_down = false
         self.side_button_used_for_highlight = false
+        self.side_button_set_by_slot = false
     end
 
     -- Eraser mode (from eraser end or hardware button) - works even if pencil disabled
