@@ -1009,11 +1009,21 @@ describe("multiplyRectHL primitive", function()
     -- Local mirror of main.lua's file-local function. Re-implemented in the
     -- spec (mirroring the project's existing pattern — see buildPickerRows,
     -- loadPenColorByName, etc.) because the helper is not exported.
+    --
+    -- Review Issue 2: the fallback used to call paintRect(x,y,w,h,color,setter)
+    -- relying on paintRect's 6-arg form, which Snowflake-era builds do not
+    -- have — the 6th arg was silently dropped and the highlighter rendered as
+    -- a luminance overwrite instead of a multiply tint. The fallback now
+    -- iterates per-pixel via setPixelMultiply with no API assumption.
     local function multiplyRectHL(bb, x, y, w, h, color)
         if bb.multiplyRectRGB then
             bb:multiplyRectRGB(x, y, w, h, color)
         else
-            bb:paintRect(x, y, w, h, color, bb.setPixelMultiply)
+            for py = y, y + h - 1 do
+                for px = x, x + w - 1 do
+                    bb:setPixelMultiply(px, py, color)
+                end
+            end
         end
     end
 
@@ -1029,19 +1039,23 @@ describe("multiplyRectHL primitive", function()
                 method = "paintRect", x = x, y = y, w = w, h = h, color = color, setter = setter,
             })
         end
-        function bb:setPixelMultiply(x, y, color) end
+        function bb:setPixelMultiply(x, y, color)
+            table.insert(self.calls, {
+                method = "setPixelMultiply", x = x, y = y, color = color,
+            })
+        end
         return bb
     end
 
     local function makeBBWithoutMultiplyRect()
+        -- No multiplyRectRGB and — critically — no 6-arg paintRect either,
+        -- mirroring Snowflake-era ffi/blitbuffer.lua (review Issue 2).
         local bb = { calls = {} }
-        -- No multiplyRectRGB — simulates older builds (e.g. Snowflake).
-        function bb:paintRect(x, y, w, h, color, setter)
+        function bb:setPixelMultiply(x, y, color)
             table.insert(self.calls, {
-                method = "paintRect", x = x, y = y, w = w, h = h, color = color, setter = setter,
+                method = "setPixelMultiply", x = x, y = y, color = color,
             })
         end
-        function bb:setPixelMultiply(x, y, color) end
         return bb
     end
 
@@ -1060,31 +1074,48 @@ describe("multiplyRectHL primitive", function()
         assert.equals(color, bb.calls[1].color)
     end)
 
-    it("falls back to paintRect with setPixelMultiply when multiplyRectRGB is absent", function()
+    it("falls back to per-pixel setPixelMultiply when multiplyRectRGB is absent", function()
+        -- 3x2 rect should produce exactly 6 setPixelMultiply calls covering
+        -- every pixel in [x, x+w) × [y, y+h). This is the contract that
+        -- protects against the Snowflake 6-arg paintRect failure mode.
         local bb = makeBBWithoutMultiplyRect()
         local color = MockBlitbuffer.ColorRGB32(0xC8, 0xE6, 0xC9, 0xFF)
 
-        multiplyRectHL(bb, 5, 6, 7, 8, color)
+        multiplyRectHL(bb, 5, 6, 3, 2, color)
 
-        assert.equals(1, #bb.calls)
-        assert.equals("paintRect", bb.calls[1].method)
-        assert.equals(5, bb.calls[1].x)
-        assert.equals(6, bb.calls[1].y)
-        assert.equals(7, bb.calls[1].w)
-        assert.equals(8, bb.calls[1].h)
-        assert.equals(color, bb.calls[1].color)
-        -- The custom setter is the multiply per-pixel function.
-        assert.equals(bb.setPixelMultiply, bb.calls[1].setter)
+        assert.equals(6, #bb.calls)
+        local hit = {}
+        for _, call in ipairs(bb.calls) do
+            assert.equals("setPixelMultiply", call.method)
+            assert.equals(color, call.color)
+            hit[call.x .. "," .. call.y] = true
+        end
+        assert.is_true(hit["5,6"])
+        assert.is_true(hit["6,6"])
+        assert.is_true(hit["7,6"])
+        assert.is_true(hit["5,7"])
+        assert.is_true(hit["6,7"])
+        assert.is_true(hit["7,7"])
     end)
 
-    it("does not call paintRect when multiplyRectRGB is available", function()
+    it("fallback covers exactly w*h pixels for a square region", function()
+        local bb = makeBBWithoutMultiplyRect()
+        multiplyRectHL(bb, 0, 0, 4, 4,
+            MockBlitbuffer.ColorRGB32(0xFF, 0xF5, 0x9D, 0xFF))
+        assert.equals(16, #bb.calls)
+    end)
+
+    it("does not call setPixelMultiply when multiplyRectRGB is available", function()
         -- Guards the dispatch order: the fast-path must win over the fallback.
+        -- (Per-pixel iteration on the modern BB would defeat the whole point
+        -- of the rect-multiply primitive.)
         local bb = makeBBWithMultiplyRect()
 
-        multiplyRectHL(bb, 0, 0, 1, 1,
+        multiplyRectHL(bb, 0, 0, 100, 100,
             MockBlitbuffer.ColorRGB32(0xFF, 0xF5, 0x9D, 0xFF))
 
         for _, call in ipairs(bb.calls) do
+            assert.not_equals("setPixelMultiply", call.method)
             assert.not_equals("paintRect", call.method)
         end
     end)

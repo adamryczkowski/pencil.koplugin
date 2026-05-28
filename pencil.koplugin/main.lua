@@ -44,16 +44,40 @@ local TOOL_ERASER = "eraser"
 local COLOR_PICKER_DELAY_MS = 1500  -- How long pen must be held still (milliseconds)
 local COLOR_PICKER_TOLERANCE_PIXELS = 25  -- How many pixels pen can move while "still"
 
+-- Live-draw refresh cadence for highlighter strokes. Pen strokes keep the
+-- default 16ms (~60fps) refreshUI cadence so handwriting feel and color
+-- fidelity are unchanged. Highlighter strokes need a slower cadence and the
+-- Fast waveform — at 16ms / refreshUI the GC16 high-quality waveform piles
+-- up under fast pen motion ("same patch redrawn over and over"). 50ms /
+-- refreshFast keeps the queue clear. The final crisp redraw still happens
+-- via scheduleDelayedRefresh after pen-up, so saved-stroke quality is
+-- preserved for both tools — only the live-draw cadence diverges per-tool.
+local HL_REFRESH_INTERVAL_MS = 50
+
 -- Highlighter rect-multiply primitive picker. KOReader-base added
 -- multiplyRectRGB only relatively recently; older builds (e.g. Snowflake)
--- only expose the per-pixel setPixelMultiply setter. Both end up calling
--- the same setPixel under the hood when CBB is unavailable, so this is
--- about reaching whatever fast-path the host BB type happens to have.
+-- only expose the per-pixel setPixelMultiply setter.
+--
+-- The fallback used to dispatch via bb:paintRect(x, y, w, h, color, setter)
+-- relying on paintRect's 6-argument form (optional custom setter). That form
+-- only exists on newer KOReader-base; the Snowflake-era ffi/blitbuffer.lua
+-- ships paintRect(self, x, y, w, h, value) with no trailing setter parameter
+-- (review Issue 2). On such builds the 6th argument is silently dropped,
+-- paintRect's default setter runs (luminance overwrite of ColorRGB32) and
+-- the highlighter renders as a solid overwrite instead of a multiply tint —
+-- the exact failure mode the helper was written to avoid, hit precisely on
+-- the older builds whose API is most likely to differ. The explicit per-
+-- pixel loop has the same algorithmic cost (setPixelMultiply is what the
+-- setter form would have dispatched to anyway) without the API assumption.
 local function multiplyRectHL(bb, x, y, w, h, color)
     if bb.multiplyRectRGB then
         bb:multiplyRectRGB(x, y, w, h, color)
     else
-        bb:paintRect(x, y, w, h, color, bb.setPixelMultiply)
+        for py = y, y + h - 1 do
+            for px = x, x + w - 1 do
+                bb:setPixelMultiply(px, py, color)
+            end
+        end
     end
 end
 
@@ -101,9 +125,11 @@ local Pencil = InputContainer:extend{
     pen_y = 0,
 
     last_refresh_time = 0,
-    refresh_interval_ms = 50,  -- Refresh at most every 50ms during drawing (~20Hz, the
-                               -- ceiling of what e-ink fast-mode can usefully drive).
-                               -- Was 16ms (60Hz) — backed up the e-ink refresh queue.
+    refresh_interval_ms = 16,  -- Pen-stroke cadence: refresh at most every 16ms
+                               -- (~60fps) during drawing. Highlighter strokes use
+                               -- a slower cadence (HL_REFRESH_INTERVAL_MS below)
+                               -- to keep the e-ink refresh queue from backing up;
+                               -- see addRawPoint for the per-tool gating.
     dirty_region = nil,  -- Accumulated dirty region for batch refresh
 
     -- Delayed refresh - only refresh after user stops writing
@@ -725,7 +751,10 @@ function Pencil:addRawPoint(x, y)
         local p1 = self.current_stroke.points[n - 1]
         local p2 = self.current_stroke.points[n]
         if self.current_stroke.tool == TOOL_HIGHLIGHTER then
-            self:drawHighlighterSegment(Screen.bb, p1.x, p1.y, p2.x, p2.y, width, color)
+            -- Segment loop: previous endpoint was already stamped (either by
+            -- the n==1 branch or by the previous segment's p2). Pass
+            -- include_start=false so shared endpoints don't compound-darken.
+            self:drawHighlighterSegment(Screen.bb, p1.x, p1.y, p2.x, p2.y, width, color, false)
         else
             self:drawLineSegment(Screen.bb, p1.x, p1.y, p2.x, p2.y, width, color)
         end
@@ -751,16 +780,21 @@ function Pencil:addRawPoint(x, y)
         end
     end
 
-    -- Periodic refresh of dirty region only.
-    -- Use refreshFast (the GC-fast waveform): partial-update, no flash,
-    -- ~150ms latency. refreshUI runs the GC16 high-quality waveform (~250ms)
-    -- and on color e-ink the queue piles up under fast pen motion — that
-    -- showed as "same patch redrawn over and over" during highlight strokes.
+    -- Periodic refresh of dirty region only. Cadence and waveform are gated
+    -- per-tool (review Issue 3):
+    --   * Pen: default 16ms (~60fps), refreshUI (GC16 high-quality waveform).
+    --     Handwriting feel and color fidelity match the pre-MR behaviour.
+    --   * Highlighter: HL_REFRESH_INTERVAL_MS (50ms, ~20Hz), refreshFast
+    --     (GC-fast waveform, partial-update, no flash, ~150ms latency).
+    --     At pen's 16ms/GC16 cadence the queue backs up under fast highlight
+    --     motion ("same patch redrawn over and over"); the slower Fast-mode
+    --     cadence keeps the queue clear.
     -- The final crisp redraw still happens via scheduleDelayedRefresh after
-    -- pen-up (a "fast" UI setDirty), so colour quality on the saved stroke
-    -- is preserved — only the live-draw cadence changes here.
+    -- pen-up, so colour quality on saved strokes is preserved for both tools.
+    local is_highlighter_stroke = self.current_stroke.tool == TOOL_HIGHLIGHTER
+    local interval_ms = is_highlighter_stroke and HL_REFRESH_INTERVAL_MS or self.refresh_interval_ms
     local now = time.now()
-    if time.to_ms(now - self.last_refresh_time) >= self.refresh_interval_ms then
+    if time.to_ms(now - self.last_refresh_time) >= interval_ms then
         self.last_refresh_time = now
         if self.dirty_region then
             local r = self.dirty_region
@@ -768,7 +802,11 @@ function Pencil:addRawPoint(x, y)
             local ry = math.max(0, math.floor(r.y))
             local rw = math.min(Screen:getWidth() - rx, math.ceil(r.w))
             local rh = math.min(Screen:getHeight() - ry, math.ceil(r.h))
-            Screen:refreshFast(rx, ry, rw, rh)
+            if is_highlighter_stroke then
+                Screen:refreshFast(rx, ry, rw, rh)
+            else
+                Screen:refreshUI(rx, ry, rw, rh)
+            end
             self.dirty_region = nil
         end
     end
@@ -2751,6 +2789,20 @@ function Pencil:onDrawPan(ges)
         -- Use start_pos if available for the first point
         if ges.start_pos then
             table.insert(self.current_stroke.points, { x = ges.start_pos.x, y = ges.start_pos.y })
+            -- Fallback bug-fix (review Issue 6): the n>=2 highlighter branch
+            -- below calls drawHighlighterSegment with include_start=false to
+            -- avoid compound-darkening shared endpoints on multi-segment
+            -- strokes. That makes start_pos unstamped on the first invocation
+            -- after the fallback creates the stroke. Stamp it here so the
+            -- highlighter doesn't show a width-sized gap at the beginning of
+            -- a fallback stroke. Pen has no exclude-start contract (its
+            -- drawLineSegment loops from i=0), so it does not need this.
+            if effective_tool == TOOL_HIGHLIGHTER then
+                local hl_half_w = math.floor(tool_settings.width / 2)
+                multiplyRectHL(Screen.bb,
+                    ges.start_pos.x - hl_half_w, ges.start_pos.y - hl_half_w,
+                    tool_settings.width, tool_settings.width, tool_settings.color)
+            end
         end
     end
 
@@ -2769,7 +2821,11 @@ function Pencil:onDrawPan(ges)
         local p2 = self.current_stroke.points[n]
 
         if effective_tool == TOOL_HIGHLIGHTER then
-            self:drawHighlighterSegment(Screen.bb, p1.x, p1.y, p2.x, p2.y, width, color)
+            -- Segment loop: see addRawPoint note. Start point was either
+            -- stamped by the n==1 branch on a prior call, or — for the
+            -- fallback path — by the explicit stamp added above when
+            -- ges.start_pos was seeded into points[1].
+            self:drawHighlighterSegment(Screen.bb, p1.x, p1.y, p2.x, p2.y, width, color, false)
         else
             self:drawLineSegment(Screen.bb, p1.x, p1.y, p2.x, p2.y, width, color)
         end
@@ -3353,7 +3409,9 @@ function Pencil:renderStrokeOffset(bb, stroke, dx, dy)
             local p1 = stroke.points[i - 1]
             local p2 = stroke.points[i]
             if is_highlighter then
-                self:drawHighlighterSegment(bb, p1.x + dx, p1.y + dy, p2.x + dx, p2.y + dy, width, color)
+                -- Segment loop, pass include_start=false to avoid
+                -- compound-darkening shared endpoints.
+                self:drawHighlighterSegment(bb, p1.x + dx, p1.y + dy, p2.x + dx, p2.y + dy, width, color, false)
             else
                 self:drawLineSegment(bb, p1.x + dx, p1.y + dy, p2.x + dx, p2.y + dy, width, color)
             end
@@ -3822,22 +3880,34 @@ end
 
 -- Render a highlighter segment using multiply blending.
 --
--- Stamps from p1 toward p2 EXCLUSIVE of p1: the caller is responsible for
--- stamping the very first point of the stroke (addRawPoint does this for
--- live drawing, renderStroke does it for replay). Without this exclusion,
--- consecutive segments would each re-stamp the shared endpoint — slow
--- strokes, where pen samples land within one width of each other, would
--- pile up many multiply ops on the same pixels and burn in dark squares
--- along the stroke body. Excluding the start point caps each pixel at
--- ~one multiply per segment, which is what makes slow strokes look the
--- same as fast ones.
-function Pencil:drawHighlighterSegment(bb, x1, y1, x2, y2, width, color)
+-- include_start (default true) controls whether p1 itself is stamped.
+--   * Default (true) makes a standalone call self-contained: any caller
+--     handing a single (p1, p2) pair gets the line including its start.
+--     This is what the onDrawPan fallback path needs — it materializes
+--     p1 from ges.start_pos and p2 from ges.pos in a single invocation
+--     and would otherwise leave the very first pixel of a fallback
+--     highlighter stroke unstamped.
+--   * Segment loops (addRawPoint n>=2, renderStroke i=2..N, and the
+--     thumbnail/preview render loop) MUST pass false. Adjacent segments
+--     share an endpoint; including p1 on every iteration would compound-
+--     darken the shared pixel with multiple multiply ops and burn dark
+--     squares into the stroke body on slow strokes where pen samples
+--     land within one width of each other. Those callers stamp the very
+--     first point of the stroke once outside the loop instead, which
+--     caps each pixel at ~one multiply per segment.
+function Pencil:drawHighlighterSegment(bb, x1, y1, x2, y2, width, color, include_start)
+    if include_start == nil then include_start = true end
+
     local dx = x2 - x1
     local dy = y2 - y1
     local dist = math.sqrt(dx * dx + dy * dy)
 
     local highlight_color = color or Blitbuffer.ColorRGB32(0xFF, 0xF5, 0x9D, 0xFF)
     local half_w = math.floor(width / 2)
+
+    if include_start then
+        multiplyRectHL(bb, x1 - half_w, y1 - half_w, width, width, highlight_color)
+    end
 
     if dist < 1 then
         multiplyRectHL(bb, x2 - half_w, y2 - half_w, width, width, highlight_color)
@@ -3976,7 +4046,9 @@ function Pencil:renderStroke(bb, stroke)
             local p1 = stroke.points[i - 1]
             local p2 = stroke.points[i]
             if is_highlighter then
-                self:drawHighlighterSegment(bb, p1.x, p1.y, p2.x, p2.y, width, color)
+                -- Segment loop: p0 was stamped above, every subsequent p1
+                -- is a prior segment's p2. Pass include_start=false.
+                self:drawHighlighterSegment(bb, p1.x, p1.y, p2.x, p2.y, width, color, false)
             else
                 self:drawLineSegment(bb, p1.x, p1.y, p2.x, p2.y, width, color)
             end
