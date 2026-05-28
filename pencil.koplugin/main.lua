@@ -42,7 +42,12 @@ local TOOL_PEN = "pen"
 local TOOL_HIGHLIGHTER = "highlighter"
 local TOOL_ERASER = "eraser"
 
--- Color picker trigger settings
+-- Color picker trigger settings. Tuned upward from prior 500ms / 15px
+-- (review Issue 14): the earlier thresholds risked triggering during
+-- normal hold+draw and during slow stroke starts where the pen lingers
+-- briefly before motion picks up. Raising the dwell time and the
+-- tolerance window biases toward intentional gesture detection at the
+-- cost of a slightly longer hold to summon the picker.
 local COLOR_PICKER_DELAY_MS = 1500  -- How long pen must be held still (milliseconds)
 local COLOR_PICKER_TOLERANCE_PIXELS = 25  -- How many pixels pen can move while "still"
 
@@ -2608,7 +2613,14 @@ function Pencil:showColorPicker(x, y)
     logger.dbg("Pencil: color picker shown at", picker_x, picker_y)
 end
 
--- Set pen color
+-- Set pen color.
+--
+-- Intentionally left as a mechanical clone of setHighlighterColor rather
+-- than collapsed into a `setToolColor(tool, color, color_name)` helper
+-- (review PJ1). With only two color-bearing tools the indirection costs
+-- more than the duplication saves; the two setters also differ slightly
+-- (setHighlighterColor folds a user-feedback InfoMessage from Issue 12).
+-- Revisit if a third color-bearing tool appears.
 function Pencil:setPenColor(color, color_name)
     self.tool_settings[TOOL_PEN].color = color
     self.tool_settings[TOOL_PEN].color_name = color_name
@@ -4121,10 +4133,21 @@ function Pencil:renderStroke(bb, stroke)
     end
 
     -- Highlighter: keep stored color (set when the stroke was made) or fall
-    -- back to the configured default. Default is the new translucent yellow
-    -- (alpha 0x80); legacy strokes saved before the alpha-blend rewrite still
-    -- carry their old opaque Color8 and will render opaque, which is fine for
-    -- backward compatibility.
+    -- back to the configured default (available_highlighter_colors[1], Yellow
+    -- — set up in init() and routed here via tool_settings).
+    --
+    -- Rendering: all highlighter strokes — including legacy strokes saved
+    -- before this MR with the old Color8(0xDD) light-gray — now go through
+    -- drawHighlighterSegment / multiplyRectHighlighter, i.e. multiply-blend.
+    -- This is a deliberate change: the multiply path is what makes the
+    -- highlighter look "behind text" (result = src * dst / 255 per channel,
+    -- so dark text stays dark and white bg takes the tint). The earlier
+    -- prose claimed legacy strokes "render opaque, which is fine for
+    -- backward compatibility" — that is no longer true and was corrected
+    -- as part of the MR-review fixes (PJ2). The visual difference for
+    -- legacy strokes is subtle (Color8 multiplied behaves like a gray
+    -- tint) and considered acceptable; nothing is required to migrate
+    -- saved strokes.
     local is_highlighter = (tool == TOOL_HIGHLIGHTER)
     if is_highlighter then
         color = stroke.color or self.tool_settings[TOOL_HIGHLIGHTER].color
