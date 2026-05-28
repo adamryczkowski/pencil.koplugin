@@ -22,6 +22,8 @@ local Screen = Device.screen
 local Size = require("ui/size")
 local InfoMessage = require("ui/widget/infomessage")
 local InputContainer = require("ui/widget/container/inputcontainer")
+local TextWidget = require("ui/widget/textwidget")
+local Font = require("ui/font")
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local lfs = require("libs/libkoreader-lfs")
@@ -69,7 +71,7 @@ local HL_REFRESH_INTERVAL_MS = 50
 -- the older builds whose API is most likely to differ. The explicit per-
 -- pixel loop has the same algorithmic cost (setPixelMultiply is what the
 -- setter form would have dispatched to anyway) without the API assumption.
-local function multiplyRectHL(bb, x, y, w, h, color)
+local function multiplyRectHighlighter(bb, x, y, w, h, color)
     if bb.multiplyRectRGB then
         bb:multiplyRectRGB(x, y, w, h, color)
     else
@@ -82,7 +84,7 @@ local function multiplyRectHL(bb, x, y, w, h, color)
 end
 
 -- Stamp a single point centred on (x, y) at the given width. Pen uses
--- paintRectRGB32 (solid fill); highlighter uses multiplyRectHL (multiply
+-- paintRectRGB32 (solid fill); highlighter uses multiplyRectHighlighter (multiply
 -- blend over existing pixels). Single-sources the "highlighter uses
 -- multiply, pen uses solid" branch that was previously duplicated across
 -- four stamping sites (addRawPoint n==1, onDrawPan n==1, onDrawPan fallback
@@ -90,7 +92,7 @@ end
 local function stampPoint(bb, x, y, width, color, is_highlighter)
     local half_w = math.floor(width / 2)
     if is_highlighter then
-        multiplyRectHL(bb, x - half_w, y - half_w, width, width, color)
+        multiplyRectHighlighter(bb, x - half_w, y - half_w, width, width, color)
     else
         bb:paintRectRGB32(x - half_w, y - half_w, width, width, color)
     end
@@ -1137,6 +1139,14 @@ end
 -- validation policy for both pen and highlighter loaders (review Issue 10).
 -- On match: assigns both color and color_name to tool_settings[tool], returns
 -- true. On nil or no-match: leaves init defaults intact, returns false.
+--
+-- The no-match path emits an info-level log (review EF1). Previously, an
+-- unrecognized highlighter_color_name was silently discarded — palette
+-- renames across versions, settings tampering, or a fresh install reading
+-- an old settings file would all reset the saved color with no signal to
+-- the user or to the log. The log lets the cause be diagnosed after the
+-- fact without changing the user-visible behaviour (still falls back to
+-- the init default).
 function Pencil:loadToolColorByName(tool, color_name, palette)
     if not color_name then return false end
     for _, color_info in ipairs(palette) do
@@ -1146,6 +1156,8 @@ function Pencil:loadToolColorByName(tool, color_name, palette)
             return true
         end
     end
+    logger.info("Pencil: unknown color_name '" .. tostring(color_name)
+        .. "' for tool '" .. tostring(tool) .. "', keeping default")
     return false
 end
 
@@ -2037,6 +2049,11 @@ local ColorPickerWidget = InputContainer:extend {
     current_width = nil, -- Currently selected pen width (for width selection indicator)
     callback = nil,
     close_callback = nil,
+    -- Optional header text shown above the color/width rows. Used by
+    -- showColorPicker to disambiguate "this pick will set the highlighter
+    -- color" from "this pick will set the pen color" before the user
+    -- commits (review EF2). Nil = no header row.
+    title = nil,
     -- Layout constants cached after init so handlePenTap / paintTo don't
     -- recompute them. Kept on self so tests can read them too.
     _button_size = nil,
@@ -2211,17 +2228,33 @@ function ColorPickerWidget:init()
         widths_row_width = #width_items * button_size + (#width_items - 1) * spacing
     end
 
-    -- Inner width accommodates the wider of the visible rows. Height
-    -- accumulates one button_size per visible row plus a gap when both
-    -- are showing.
-    local visible_rows = (has_colors and 1 or 0) + (has_widths and 1 or 0)
-    local inner_w = math.max(colors_row_width, widths_row_width)
-    self.width = inner_w
-    self.height = visible_rows * button_size + (visible_rows > 1 and row_gap or 0)
+    -- Optional title row (review EF2). Built first so its measured width
+    -- can widen the picker to fit text longer than the color row.
+    local title_widget
+    local title_row_h = 0
+    if self.title and #self.title > 0 then
+        title_widget = TextWidget:new{
+            text = self.title,
+            face = Font:getFace("smallinfofont"),
+        }
+        title_row_h = title_widget:getSize().h
+    end
 
-    local content
+    -- Inner width accommodates the wider of the visible rows (including
+    -- the title row). Height accumulates one button_size per visible
+    -- color/width row plus a gap when both are showing, plus the title
+    -- row + gap when a title is present.
+    local visible_rows = (has_colors and 1 or 0) + (has_widths and 1 or 0)
+    local title_row_w = title_widget and title_widget:getSize().w or 0
+    local inner_w = math.max(colors_row_width, widths_row_width, title_row_w)
+    self.width = inner_w
+    self.height = visible_rows * button_size
+        + (visible_rows > 1 and row_gap or 0)
+        + (title_widget and (title_row_h + row_gap) or 0)
+
+    local body
     if has_colors and has_widths then
-        content = VerticalGroup:new{
+        body = VerticalGroup:new{
             align = "center",
             CenterContainer:new{
                 dimen = Geom:new{ w = inner_w, h = button_size },
@@ -2234,16 +2267,31 @@ function ColorPickerWidget:init()
             },
         }
     elseif has_colors then
-        content = CenterContainer:new{
+        body = CenterContainer:new{
             dimen = Geom:new{ w = inner_w, h = button_size },
             color_row_group,
         }
     else
         -- widths-only picker (color picker experimental flag off)
-        content = CenterContainer:new{
+        body = CenterContainer:new{
             dimen = Geom:new{ w = inner_w, h = button_size },
             width_row_group,
         }
+    end
+
+    local content
+    if title_widget then
+        content = VerticalGroup:new{
+            align = "center",
+            CenterContainer:new{
+                dimen = Geom:new{ w = inner_w, h = title_row_h },
+                title_widget,
+            },
+            VerticalSpan:new{ width = row_gap },
+            body,
+        }
+    else
+        content = body
     end
 
     self.frame = FrameContainer:new{
@@ -2460,6 +2508,13 @@ function Pencil:showColorPicker(x, y)
     if rows > 1 then
         picker_height = picker_height + row_gap
     end
+    -- Account for the optional title row used to disambiguate highlighter-
+    -- mode picks from pen-mode picks (review EF2). Estimate at a small-font
+    -- line height + one row gap; the widget itself measures the actual title
+    -- and uses that, so this is only used for picker positioning bounds.
+    if highlighter_mode then
+        picker_height = picker_height + Screen:scaleBySize(20) + row_gap
+    end
     local margin_above = Screen:scaleBySize(30)  -- Gap between picker and pen
     local screen_margin = 10  -- Minimum margin from screen edges
 
@@ -2493,6 +2548,12 @@ function Pencil:showColorPicker(x, y)
         widths = widths_for_picker,
         current_color_name = current_color_name,
         current_width = self.tool_settings[TOOL_PEN].width,
+        -- Visual mode indicator (review EF2). Pre-selection the user holding
+        -- the side button would otherwise see the same picker with a swapped
+        -- palette and no signal that this pick routes to the highlighter.
+        -- The post-selection "Highlighter: %1" InfoMessage disambiguates only
+        -- after the fact; the title provides the cue up-front.
+        title = highlighter_mode and _("Highlighter color") or nil,
         callback = function(color_value, color_name, width_value)
             -- Width taps are routed through width_value; color taps leave it nil.
             -- This avoids the string-match ambiguity the earlier prototype had.
@@ -3952,11 +4013,11 @@ function Pencil:drawHighlighterSegment(bb, x1, y1, x2, y2, width, color, include
     local half_w = math.floor(width / 2)
 
     if include_start then
-        multiplyRectHL(bb, x1 - half_w, y1 - half_w, width, width, highlight_color)
+        multiplyRectHighlighter(bb, x1 - half_w, y1 - half_w, width, width, highlight_color)
     end
 
     if dist < 1 then
-        multiplyRectHL(bb, x2 - half_w, y2 - half_w, width, width, highlight_color)
+        multiplyRectHighlighter(bb, x2 - half_w, y2 - half_w, width, width, highlight_color)
         return
     end
 
@@ -3967,7 +4028,7 @@ function Pencil:drawHighlighterSegment(bb, x1, y1, x2, y2, width, color, include
         local t = i / steps
         local x = math.floor(x1 + dx * t)
         local y = math.floor(y1 + dy * t)
-        multiplyRectHL(bb, x - half_w, y - half_w, width, width, highlight_color)
+        multiplyRectHighlighter(bb, x - half_w, y - half_w, width, width, highlight_color)
     end
 end
 

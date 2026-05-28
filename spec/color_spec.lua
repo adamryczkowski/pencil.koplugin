@@ -837,7 +837,7 @@ end)
 -- Highlighter color API (parallel to pen color tests above).
 -- Added to cover the Goal 1 surface introduced by the color-and-highlight-button
 -- MR: setHighlighterColor, the 5-color available_highlighter_colors palette,
--- highlighter_color_name settings round-trip, and the multiplyRectHL primitive.
+-- highlighter_color_name settings round-trip, and the multiplyRectHighlighter primitive.
 -- ---------------------------------------------------------------------------
 
 describe("highlighter color functionality", function()
@@ -1000,14 +1000,14 @@ end)
 
 
 -- ---------------------------------------------------------------------------
--- multiplyRectHL primitive (main.lua:52-58).
+-- multiplyRectHighlighter primitive (main.lua:52-58).
 -- The helper picks the host blitbuffer's fast-path: rect-multiply if
 -- multiplyRectRGB is available (modern KOReader-base), else paintRect with
 -- the setPixelMultiply per-pixel setter (older builds, e.g. Snowflake).
 -- These tests verify dispatch against both shapes of mock blitbuffer.
 -- ---------------------------------------------------------------------------
 
-describe("multiplyRectHL primitive", function()
+describe("multiplyRectHighlighter primitive", function()
 
     -- Local mirror of main.lua's file-local function. Re-implemented in the
     -- spec (mirroring the project's existing pattern — see buildPickerRows,
@@ -1018,7 +1018,7 @@ describe("multiplyRectHL primitive", function()
     -- have — the 6th arg was silently dropped and the highlighter rendered as
     -- a luminance overwrite instead of a multiply tint. The fallback now
     -- iterates per-pixel via setPixelMultiply with no API assumption.
-    local function multiplyRectHL(bb, x, y, w, h, color)
+    local function multiplyRectHighlighter(bb, x, y, w, h, color)
         if bb.multiplyRectRGB then
             bb:multiplyRectRGB(x, y, w, h, color)
         else
@@ -1066,7 +1066,7 @@ describe("multiplyRectHL primitive", function()
         local bb = makeBBWithMultiplyRect()
         local color = MockBlitbuffer.ColorRGB32(0xFF, 0xF5, 0x9D, 0xFF)
 
-        multiplyRectHL(bb, 10, 20, 30, 40, color)
+        multiplyRectHighlighter(bb, 10, 20, 30, 40, color)
 
         assert.equals(1, #bb.calls)
         assert.equals("multiplyRectRGB", bb.calls[1].method)
@@ -1084,7 +1084,7 @@ describe("multiplyRectHL primitive", function()
         local bb = makeBBWithoutMultiplyRect()
         local color = MockBlitbuffer.ColorRGB32(0xC8, 0xE6, 0xC9, 0xFF)
 
-        multiplyRectHL(bb, 5, 6, 3, 2, color)
+        multiplyRectHighlighter(bb, 5, 6, 3, 2, color)
 
         assert.equals(6, #bb.calls)
         local hit = {}
@@ -1103,7 +1103,7 @@ describe("multiplyRectHL primitive", function()
 
     it("fallback covers exactly w*h pixels for a square region", function()
         local bb = makeBBWithoutMultiplyRect()
-        multiplyRectHL(bb, 0, 0, 4, 4,
+        multiplyRectHighlighter(bb, 0, 0, 4, 4,
             MockBlitbuffer.ColorRGB32(0xFF, 0xF5, 0x9D, 0xFF))
         assert.equals(16, #bb.calls)
     end)
@@ -1114,7 +1114,7 @@ describe("multiplyRectHL primitive", function()
         -- of the rect-multiply primitive.)
         local bb = makeBBWithMultiplyRect()
 
-        multiplyRectHL(bb, 0, 0, 100, 100,
+        multiplyRectHighlighter(bb, 0, 0, 100, 100,
             MockBlitbuffer.ColorRGB32(0xFF, 0xF5, 0x9D, 0xFF))
 
         for _, call in ipairs(bb.calls) do
