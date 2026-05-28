@@ -41,8 +41,21 @@ local TOOL_HIGHLIGHTER = "highlighter"
 local TOOL_ERASER = "eraser"
 
 -- Color picker trigger settings
-local COLOR_PICKER_DELAY_MS = 500  -- How long pen must be held still (milliseconds)
-local COLOR_PICKER_TOLERANCE_PIXELS = 15  -- How many pixels pen can move while "still"
+local COLOR_PICKER_DELAY_MS = 1500  -- How long pen must be held still (milliseconds)
+local COLOR_PICKER_TOLERANCE_PIXELS = 25  -- How many pixels pen can move while "still"
+
+-- Highlighter rect-multiply primitive picker. KOReader-base added
+-- multiplyRectRGB only relatively recently; older builds (e.g. Snowflake)
+-- only expose the per-pixel setPixelMultiply setter. Both end up calling
+-- the same setPixel under the hood when CBB is unavailable, so this is
+-- about reaching whatever fast-path the host BB type happens to have.
+local function multiplyRectHL(bb, x, y, w, h, color)
+    if bb.multiplyRectRGB then
+        bb:multiplyRectRGB(x, y, w, h, color)
+    else
+        bb:paintRect(x, y, w, h, color, bb.setPixelMultiply)
+    end
+end
 
 -- Annotation grouping constants
 local GROUP_TIME_THRESHOLD_S = 10   -- seconds between strokes to be grouped
@@ -88,7 +101,9 @@ local Pencil = InputContainer:extend{
     pen_y = 0,
 
     last_refresh_time = 0,
-    refresh_interval_ms = 16,  -- Refresh at most every 16ms during drawing (~60fps)
+    refresh_interval_ms = 50,  -- Refresh at most every 50ms during drawing (~20Hz, the
+                               -- ceiling of what e-ink fast-mode can usefully drive).
+                               -- Was 16ms (60Hz) — backed up the e-ink refresh queue.
     dirty_region = nil,  -- Accumulated dirty region for batch refresh
 
     -- Delayed refresh - only refresh after user stops writing
@@ -148,9 +163,6 @@ function Pencil:init()
     self.strokes_loaded = false  -- Set true after successful loadStrokes
     self.undo_stack = {}
 
-    -- Initialize highlighter color (yellow)
-    self.tool_settings[TOOL_HIGHLIGHTER].color = Blitbuffer.Color8(0xDD)  -- Light gray for e-ink
-
     -- Calculate gray value from highlight_lighten_factor setting
     local lighten_factor = G_reader_settings:readSetting("highlight_lighten_factor") or 0.2
     local gray_value = math.floor(255 * (1 - lighten_factor))
@@ -168,6 +180,25 @@ function Pencil:init()
         { name = "Purple", color = Blitbuffer.ColorRGB32(0xEE, 0x00, 0xFF, 0xFF) },
         { name = "Gray", color = Blitbuffer.Color8(gray_value) },
     }
+
+    -- Highlighter palette: pale base hues. Rendering uses multiply blending,
+    -- which computes result = src * dst / 255 per channel. With very light
+    -- source colors:
+    --   * white bg (255) * src ≈ src (the highlight color shows through)
+    --   * dark text (40) * src ≈ slightly-tinted dark (text stays readable)
+    -- Saturated source colors compound-darken on multi-stamp overlap and
+    -- can make text muddy; pale tints stay friendly even after a couple of
+    -- stamp passes.
+    self.available_highlighter_colors = {
+        { name = "Yellow", color = Blitbuffer.ColorRGB32(0xFF, 0xF5, 0x9D, 0xFF) },
+        { name = "Green",  color = Blitbuffer.ColorRGB32(0xC8, 0xE6, 0xC9, 0xFF) },
+        { name = "Pink",   color = Blitbuffer.ColorRGB32(0xF8, 0xBB, 0xD0, 0xFF) },
+        { name = "Cyan",   color = Blitbuffer.ColorRGB32(0xB3, 0xE5, 0xFC, 0xFF) },
+        { name = "Orange", color = Blitbuffer.ColorRGB32(0xFF, 0xCC, 0x80, 0xFF) },
+    }
+    -- Default highlighter color is Yellow.
+    self.tool_settings[TOOL_HIGHLIGHTER].color = self.available_highlighter_colors[1].color
+    self.tool_settings[TOOL_HIGHLIGHTER].color_name = self.available_highlighter_colors[1].name
 
     -- Available pen widths for the optional experimental width picker.
     -- Gated by self.experimental_pen_width; see loadSettings().
@@ -378,6 +409,22 @@ function Pencil:handleStylusSlot(input, slot)
         self.eraser_button_active = false
         self.eraser_button_deleted = nil
         UIManager:setDirty(self.view, "ui")
+    end
+
+    -- Detect side-button highlight gesture via slot.tool. On Kobo, BTN_STYLUS2
+    -- is consumed by the stylus-callback domination path, so the "Highlighter"
+    -- KEY event never reaches onKeyPress. input.lua remaps slot.tool to
+    -- TOOL_TYPE_HIGHLIGHTER (or ERASER under swap) while BTN_STYLUS2 is held;
+    -- bind side_button_down to that signal so startRawStroke picks the
+    -- highlighter tool. The "tap to toggle pen/eraser" half of the side-button
+    -- behavior is unreachable on Kobo (no slot updates without pen contact)
+    -- and remains gated on the keypath for devices where it does fire.
+    local highlighter_slot_tool = self.swap_eraser_and_highlighter and TOOL_TYPE_ERASER or TOOL_TYPE_HIGHLIGHTER
+    if slot.tool == highlighter_slot_tool then
+        self.side_button_down = true
+    elseif self.side_button_down then
+        self.side_button_down = false
+        self.side_button_used_for_highlight = false
     end
 
     -- Eraser mode (from eraser end or hardware button) - works even if pencil disabled
@@ -647,12 +694,18 @@ function Pencil:addRawPoint(x, y)
         color = color:invert()
     end
 
-    -- Draw to framebuffer and track dirty region
+    -- Draw to framebuffer and track dirty region.
+    -- Highlighter uses multiplyRectRGB (KOReader's highlighter primitive):
+    -- result = src * dst / 255 per channel, so white bg becomes the highlight
+    -- color and dark text stays dark — visually equivalent to "behind text".
     local dirty_x, dirty_y, dirty_w, dirty_h
     if n == 1 then
-        -- Draw first point same size as line segments for consistency
         local half_w_draw = math.floor(width / 2)
-        Screen.bb:paintRectRGB32(x - half_w_draw, y - half_w_draw, width, width, color)
+        if self.current_stroke.tool == TOOL_HIGHLIGHTER then
+            multiplyRectHL(Screen.bb, x - half_w_draw, y - half_w_draw, width, width, color)
+        else
+            Screen.bb:paintRectRGB32(x - half_w_draw, y - half_w_draw, width, width, color)
+        end
         -- Use slightly larger dirty region for refresh padding
         dirty_x = x - half_w
         dirty_y = y - half_w
@@ -688,19 +741,24 @@ function Pencil:addRawPoint(x, y)
         end
     end
 
-    -- Periodic refresh of dirty region only
+    -- Periodic refresh of dirty region only.
+    -- Use refreshFast (the GC-fast waveform): partial-update, no flash,
+    -- ~150ms latency. refreshUI runs the GC16 high-quality waveform (~250ms)
+    -- and on color e-ink the queue piles up under fast pen motion — that
+    -- showed as "same patch redrawn over and over" during highlight strokes.
+    -- The final crisp redraw still happens via scheduleDelayedRefresh after
+    -- pen-up (a "fast" UI setDirty), so colour quality on the saved stroke
+    -- is preserved — only the live-draw cadence changes here.
     local now = time.now()
     if time.to_ms(now - self.last_refresh_time) >= self.refresh_interval_ms then
         self.last_refresh_time = now
         if self.dirty_region then
             local r = self.dirty_region
-            -- Clamp to screen bounds
             local rx = math.max(0, math.floor(r.x))
             local ry = math.max(0, math.floor(r.y))
             local rw = math.min(Screen:getWidth() - rx, math.ceil(r.w))
             local rh = math.min(Screen:getHeight() - ry, math.ceil(r.h))
-            -- Use UI refresh mode for proper color rendering on color e-ink
-            Screen:refreshUI(rx, ry, rw, rh)
+            Screen:refreshFast(rx, ry, rw, rh)
             self.dirty_region = nil
         end
     end
@@ -1022,6 +1080,18 @@ function Pencil:loadSettings()
             end
         end
     end
+    -- Load highlighter color by name. Validated against the highlighter
+    -- palette so the alpha-baked color value is always the canonical one.
+    local hl_color_name = settings.highlighter_color_name
+    if hl_color_name then
+        for _, color_info in ipairs(self.available_highlighter_colors) do
+            if color_info.name == hl_color_name then
+                self.tool_settings[TOOL_HIGHLIGHTER].color = color_info.color
+                self.tool_settings[TOOL_HIGHLIGHTER].color_name = hl_color_name
+                break
+            end
+        end
+    end
 end
 
 -- Save plugin settings
@@ -1035,6 +1105,7 @@ function Pencil:saveSettings()
         pen_color_name = self.tool_settings[TOOL_PEN].color_name,
         swap_eraser_and_highlighter = self.swap_eraser_and_highlighter,
         pen_width = self.tool_settings[TOOL_PEN].width,
+        highlighter_color_name = self.tool_settings[TOOL_HIGHLIGHTER].color_name,
     })
 end
 
@@ -1119,6 +1190,34 @@ function Pencil:addToMainMenu(menu_items)
                         end,
                     },
                 },
+            },
+            {
+                text_func = function()
+                    return T(_("Highlighter color: %1"),
+                             self.tool_settings[TOOL_HIGHLIGHTER].color_name or _("Yellow"))
+                end,
+                help_text = _("Color used by the side-button highlight gesture. Hold the stylus side button while drawing to lay this color over text."),
+                sub_item_table_func = function()
+                    local items = {}
+                    for _, color_info in ipairs(self.available_highlighter_colors) do
+                        local name = color_info.name
+                        local color = color_info.color
+                        table.insert(items, {
+                            text = name,
+                            checked_func = function()
+                                return self.tool_settings[TOOL_HIGHLIGHTER].color_name == name
+                            end,
+                            callback = function()
+                                self:setHighlighterColor(color, name)
+                                UIManager:show(InfoMessage:new{
+                                    text = T(_("Highlighter: %1"), name),
+                                    timeout = 1,
+                                })
+                            end,
+                        })
+                    end
+                    return items
+                end,
             },
             {
                 text = _("Undo last stroke"),
@@ -2234,17 +2333,23 @@ function Pencil:showColorPicker(x, y)
         Screen:refreshUI(0, 0, Screen:getWidth(), Screen:getHeight())
     end
 
+    -- If the side button is held when the picker fires, the user is in
+    -- highlighter mode — show the highlighter palette and route picks to
+    -- tool_settings[TOOL_HIGHLIGHTER]. The width row is intentionally
+    -- hidden in highlighter mode (highlighter width isn't user-tunable).
+    local highlighter_mode = self.side_button_down
+    if highlighter_mode and not self.experimental_color_picker then
+        return
+    end
+
     self.color_picker_showing = true
 
     local plugin = self
 
-    -- Which rows to render is driven by the two experimental toggles,
-    -- independently. The hold-pen-still gesture only gets here when at
-    -- least one of them is on (see checkColorPickerTrigger), so at least
-    -- one row is guaranteed non-empty.
     local show_colors = self.experimental_color_picker
-    local show_widths = self.experimental_pen_width
-    local colors_for_picker = show_colors and self.available_colors or nil
+    local show_widths = self.experimental_pen_width and not highlighter_mode
+    local active_palette = highlighter_mode and self.available_highlighter_colors or self.available_colors
+    local colors_for_picker = show_colors and active_palette or nil
     local widths_for_picker = show_widths and self.available_widths or nil
 
     -- Picker uses up to two rows (colors on top, widths below). Row width
@@ -2256,7 +2361,7 @@ function Pencil:showColorPicker(x, y)
     local padding = Screen:scaleBySize(10)
     local border = Size.border.window
     local colors_row_width = show_colors and
-        (#self.available_colors * button_size + (#self.available_colors - 1) * spacing) or 0
+        (#active_palette * button_size + (#active_palette - 1) * spacing) or 0
     local widths_row_width = show_widths and
         (#self.available_widths * button_size + (#self.available_widths - 1) * spacing) or 0
     local buttons_width = math.max(colors_row_width, widths_row_width)
@@ -2291,10 +2396,13 @@ function Pencil:showColorPicker(x, y)
         picker_y = Screen:getHeight() - picker_height - screen_margin
     end
 
+    local current_color_name = highlighter_mode
+        and self.tool_settings[TOOL_HIGHLIGHTER].color_name
+        or self.tool_settings[TOOL_PEN].color_name
     local color_picker = ColorPickerWidget:new{
         colors = colors_for_picker,
         widths = widths_for_picker,
-        current_color_name = self.tool_settings[TOOL_PEN].color_name,
+        current_color_name = current_color_name,
         current_width = self.tool_settings[TOOL_PEN].width,
         callback = function(color_value, color_name, width_value)
             -- Width taps are routed through width_value; color taps leave it nil.
@@ -2303,6 +2411,15 @@ function Pencil:showColorPicker(x, y)
                 plugin:setPenWidth(width_value)
                 UIManager:show(InfoMessage:new{
                     text = T(_("Pen width: %1"), width_value),
+                    timeout = 1,
+                })
+                return
+            end
+
+            if highlighter_mode then
+                plugin:setHighlighterColor(color_value, color_name)
+                UIManager:show(InfoMessage:new{
+                    text = T(_("Highlighter: %1"), color_name),
                     timeout = 1,
                 })
                 return
@@ -2348,6 +2465,16 @@ function Pencil:setPenColor(color, color_name)
     self.tool_settings[TOOL_PEN].color = color
     self.tool_settings[TOOL_PEN].color_name = color_name
     logger.info("Pencil: setPenColor - color_name =", color_name)
+    self:saveSettings()
+end
+
+-- Set highlighter color. multiplyRectRGB consumes the RGB channels and
+-- ignores alpha, so the highlighter palette uses fully-opaque colors —
+-- the "behind text" effect comes from multiply blending, not from alpha.
+function Pencil:setHighlighterColor(color, color_name)
+    self.tool_settings[TOOL_HIGHLIGHTER].color = color
+    self.tool_settings[TOOL_HIGHLIGHTER].color_name = color_name
+    logger.info("Pencil: setHighlighterColor - color_name =", color_name)
     self:saveSettings()
 end
 
@@ -2639,7 +2766,11 @@ function Pencil:onDrawPan(ges)
     elseif n == 1 then
         local p = self.current_stroke.points[1]
         local half_w = math.floor(width / 2)
-        Screen.bb:paintRectRGB32(p.x - half_w, p.y - half_w, width, width, color)
+        if effective_tool == TOOL_HIGHLIGHTER then
+            multiplyRectHL(Screen.bb, p.x - half_w, p.y - half_w, width, width, color)
+        else
+            Screen.bb:paintRectRGB32(p.x - half_w, p.y - half_w, width, width, color)
+        end
     end
 
     return true
@@ -3679,29 +3810,38 @@ function Pencil:drawLineSegment(bb, x1, y1, x2, y2, width, color)
     end
 end
 
--- Render a highlighter segment (semi-transparent, wider)
+-- Render a highlighter segment using multiply blending.
+--
+-- Stamps from p1 toward p2 EXCLUSIVE of p1: the caller is responsible for
+-- stamping the very first point of the stroke (addRawPoint does this for
+-- live drawing, renderStroke does it for replay). Without this exclusion,
+-- consecutive segments would each re-stamp the shared endpoint — slow
+-- strokes, where pen samples land within one width of each other, would
+-- pile up many multiply ops on the same pixels and burn in dark squares
+-- along the stroke body. Excluding the start point caps each pixel at
+-- ~one multiply per segment, which is what makes slow strokes look the
+-- same as fast ones.
 function Pencil:drawHighlighterSegment(bb, x1, y1, x2, y2, width, color)
     local dx = x2 - x1
     local dy = y2 - y1
     local dist = math.sqrt(dx * dx + dy * dy)
 
-    -- Highlighter is drawn as a lighter gray to simulate transparency on e-ink
-    local highlight_color = color or Blitbuffer.Color8(0xDD)
+    local highlight_color = color or Blitbuffer.ColorRGB32(0xFF, 0xF5, 0x9D, 0xFF)
+    local half_w = math.floor(width / 2)
 
     if dist < 1 then
-        local half_w = math.floor(width / 2)
-        bb:paintRectRGB32(x1 - half_w, y1 - half_w, width, width, highlight_color)
+        multiplyRectHL(bb, x2 - half_w, y2 - half_w, width, width, highlight_color)
         return
     end
 
-    local steps = math.ceil(dist)
-    local half_w = math.floor(width / 2)
+    local step_size = math.max(1, width)
+    local steps = math.max(1, math.ceil(dist / step_size))
 
-    for i = 0, steps do
+    for i = 1, steps do
         local t = i / steps
         local x = math.floor(x1 + dx * t)
         local y = math.floor(y1 + dy * t)
-        bb:paintRectRGB32(x - half_w, y - half_w, width, width, highlight_color)
+        multiplyRectHL(bb, x - half_w, y - half_w, width, width, highlight_color)
     end
 end
 
@@ -3793,20 +3933,35 @@ function Pencil:renderStroke(bb, stroke)
         color = color:invert()
     end
 
-    -- Highlighter uses lighter color
+    -- Highlighter: keep stored color (set when the stroke was made) or fall
+    -- back to the configured default. Default is the new translucent yellow
+    -- (alpha 0x80); legacy strokes saved before the alpha-blend rewrite still
+    -- carry their old opaque Color8 and will render opaque, which is fine for
+    -- backward compatibility.
     local is_highlighter = (tool == TOOL_HIGHLIGHTER)
     if is_highlighter then
-        -- For highlighter, use stored color or default gray
-        color = stroke.color or Blitbuffer.Color8(0xDD)
+        color = stroke.color or self.tool_settings[TOOL_HIGHLIGHTER].color
     end
 
     if #stroke.points == 1 then
         -- Single point (dot)
         local p = stroke.points[1]
         local half_w = math.floor(width / 2)
-        bb:paintRectRGB32(p.x - half_w, p.y - half_w, width, width, color)
+        if is_highlighter then
+            multiplyRectHL(bb, p.x - half_w, p.y - half_w, width, width, color)
+        else
+            bb:paintRectRGB32(p.x - half_w, p.y - half_w, width, width, color)
+        end
     else
-        -- Multiple points - draw line segments
+        -- Multi-point stroke. drawHighlighterSegment skips the start point
+        -- (to avoid double-stamping shared endpoints between consecutive
+        -- segments, which compound-darkens slow strokes), so for the very
+        -- first point of the stroke we must stamp it ourselves once here.
+        if is_highlighter then
+            local p0 = stroke.points[1]
+            local half_w = math.floor(width / 2)
+            multiplyRectHL(bb, p0.x - half_w, p0.y - half_w, width, width, color)
+        end
         for i = 2, #stroke.points do
             local p1 = stroke.points[i - 1]
             local p2 = stroke.points[i]
