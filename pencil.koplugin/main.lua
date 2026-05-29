@@ -21,6 +21,7 @@ local PencilGeometry = require("lib/geometry")
 local DispatchPredicate = require("lib/dispatch_predicate")
 local HighlightColorWiring = require("lib/highlight_color_wiring")
 local SettingsDefaults = require("lib/settings_defaults")
+local StrokeCapture = require("lib/stroke_capture")
 local Screen = Device.screen
 local Size = require("ui/size")
 local InfoMessage = require("ui/widget/infomessage")
@@ -3230,6 +3231,15 @@ function Pencil:assignStrokeToGroup(stroke_idx, skip_bookmark)
                 group.xpointer = annot_xp
                 group.xpointer_v2 = true
             end
+        end
+        -- Goal-2: compute line-relative anchor for verbatim pen-stroke
+        -- (lib/stroke_capture.lua). Independent of xpointer_v2 above; nil
+        -- on image-only pages / off-current-page strokes / vertical-text
+        -- miss → paint-time rotation-badge path (main.lua:4239-4311).
+        local stroke_start_pt = stroke.points and stroke.points[1]
+        if stroke_start_pt then
+            group.anchor = StrokeCapture.compute_anchor(
+                self.ui.document, stroke_start_pt)
         end
         table.insert(self.annotation_groups, group)
         if not skip_bookmark then
