@@ -19,6 +19,7 @@ local VerticalGroup = require("ui/widget/verticalgroup")
 local VerticalSpan = require("ui/widget/verticalspan")
 local PencilGeometry = require("lib/geometry")
 local DispatchPredicate = require("lib/dispatch_predicate")
+local HighlightColorWiring = require("lib/highlight_color_wiring")
 local Screen = Device.screen
 local Size = require("ui/size")
 local InfoMessage = require("ui/widget/infomessage")
@@ -924,6 +925,13 @@ function Pencil:startTextHighlight(raw_x, raw_y)
             sboxes = word.sbox and { word.sbox } or {},
             pboxes = word.pbox and { word.pbox } or {},
         }
+        -- G1-COLOR-WIRING (M3): stamp drawer + color so the saved
+        -- Path-A annotation lands with the active tool's color rather
+        -- than KOReader's default highlight color (visible-regression
+        -- guard per REQUIREMENTS_FILE 'no regression on stationary
+        -- renders'). See lib/highlight_color_wiring.lua.
+        HighlightColorWiring.apply(rh.selected_text,
+            HighlightColorWiring.resolve(self.tool_settings))
     else
         rh.selected_text = nil
     end
@@ -957,6 +965,11 @@ function Pencil:extendTextHighlight(raw_x, raw_y)
                                self.ui.document, rh.hold_pos, rh.holdpan_pos)
     if ok and selected and selected.pos0 and selected.pos1 then
         rh.selected_text = selected
+        -- G1-COLOR-WIRING (M3): same wiring as in startTextHighlight; the
+        -- extend path replaces the whole selected_text dict on each tick
+        -- so the stamp must be re-applied. See lib/highlight_color_wiring.lua.
+        HighlightColorWiring.apply(rh.selected_text,
+            HighlightColorWiring.resolve(self.tool_settings))
         -- Repaint preview with the new sboxes.
         self:_paintTempSelection()
     end
