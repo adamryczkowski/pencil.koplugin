@@ -20,6 +20,7 @@ local VerticalSpan = require("ui/widget/verticalspan")
 local PencilGeometry = require("lib/geometry")
 local DispatchPredicate = require("lib/dispatch_predicate")
 local HighlightColorWiring = require("lib/highlight_color_wiring")
+local SettingsDefaults = require("lib/settings_defaults")
 local Screen = Device.screen
 local Size = require("ui/size")
 local InfoMessage = require("ui/widget/infomessage")
@@ -1139,7 +1140,11 @@ function Pencil:loadSettings()
     self.swap_eraser_and_highlighter = settings.swap_eraser_and_highlighter or false
     self.experimental_pen_width = settings.experimental_pen_width or false
     self.experimental_color_picker = settings.experimental_color_picker or false
-    self.experimental_text_highlight = settings.experimental_text_highlight or false
+    -- G1-FLIP-DEFAULT (M4): new builds default to true; explicit user
+    -- false (menu kill-switch at main.lua:1418-1439) is preserved.
+    -- Precondition: gate-audit.md confirms all 3 gate reasons resolved.
+    -- See lib/settings_defaults.lua for the full decision contract.
+    self.experimental_text_highlight = SettingsDefaults.experimentalTextHighlight(settings)
     -- Load saved pen and highlighter colors. Both go through the shared
     -- validator (review Issue 10) so the validation policy is single-sourced:
     -- the name is only assigned when it matches a palette entry. A malformed
