@@ -18,6 +18,7 @@ local HorizontalSpan = require("ui/widget/horizontalspan")
 local VerticalGroup = require("ui/widget/verticalgroup")
 local VerticalSpan = require("ui/widget/verticalspan")
 local PencilGeometry = require("lib/geometry")
+local DispatchPredicate = require("lib/dispatch_predicate")
 local Screen = Device.screen
 local Size = require("ui/size")
 local InfoMessage = require("ui/widget/infomessage")
@@ -505,12 +506,22 @@ function Pencil:handleStylusSlot(input, slot)
     end
 
     -- Native text-highlight path: runs before any draw/stroke logic.
-    -- When input.lua has promoted slot.tool to HIGHLIGHTER (side button held),
-    -- route pen events through KOReader's ReaderHighlight instead of creating
-    -- a freehand stroke. Sticky: once we enter, we stay until pen lift even
-    -- if the side button is released mid-drag.
-    if self.experimental_text_highlight
-            and (slot.tool == TOOL_TYPE_HIGHLIGHTER or self.highlighting) then
+    -- Three entry conditions (see lib/dispatch_predicate.lua):
+    --   • side-button promoted (input.lua set slot.tool to HIGHLIGHTER),
+    --   • sticky-during-drag (self.highlighting; survives mid-drag release),
+    --   • menu-selected highlighter tool (current_tool == TOOL_HIGHLIGHTER) —
+    --     widened in G1-DISPATCH-WIDEN (M2) so stylus users without
+    --     BTN_STYLUS2 can also reach Path A.
+    -- The predicate is extracted to lib/ so the routing decision is
+    -- testable without require'ing main.lua (mirrors lib/geometry.lua).
+    if DispatchPredicate.shouldRouteToTextHighlight{
+            enabled = self.experimental_text_highlight,
+            slot_tool = slot.tool,
+            tool_type_highlighter = TOOL_TYPE_HIGHLIGHTER,
+            highlighting = self.highlighting,
+            current_tool = self.current_tool,
+            tool_highlighter_name = TOOL_HIGHLIGHTER,
+    } then
         local current_slot_id = slot.id or -1
         if current_slot_id >= 0 and not self.highlighting then
             self:startTextHighlight(slot.x or 0, slot.y or 0)
