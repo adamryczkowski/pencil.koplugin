@@ -22,6 +22,7 @@ local DispatchPredicate = require("lib/dispatch_predicate")
 local HighlightColorWiring = require("lib/highlight_color_wiring")
 local SettingsDefaults = require("lib/settings_defaults")
 local StrokeCapture = require("lib/stroke_capture")
+local StrokePaint = require("lib/stroke_paint")
 local Screen = Device.screen
 local Size = require("ui/size")
 local InfoMessage = require("ui/widget/infomessage")
@@ -4228,6 +4229,10 @@ end
 function Pencil:paintTo(bb, x, y)
     if self._capturing then return end
 
+    -- G2-M4: thread the current paint blitbuffer for callbacks routed
+    -- through lib/stroke_paint (the lib has no knowledge of bb itself).
+    self._paint_bb = bb
+
     local page = self:getCurrentPage()
     local current_rot = Screen:getRotationMode()
 
@@ -4301,14 +4306,55 @@ function Pencil:paintTo(bb, x, y)
         }
     end
 
+    -- G2-M4: anchor-driven re-positioning pass. Groups whose
+    -- assignStrokeToGroup wired group.anchor at capture time paint via
+    -- lib/stroke_paint, which routes to (a) translated render when
+    -- on-screen, (b) silent clip when off-screen, or (c) rotation badge
+    -- when the anchor cannot be resolved (pcall failure or nil anchor).
+    -- Groups with anchor == nil (legacy / image-only) fall through to
+    -- the verbatim Goal-1 native-position renderStroke loop below; the
+    -- protected rotation-badge region is preserved as additive-extended
+    -- (added wrapping anchor_owned check, no existing line modified).
+    local anchor_owned = nil
+    if self.annotation_groups and self.ui and self.ui.document then
+        -- Heuristic em / lh in pixels for paint-time delta scaling. The
+        -- EM-relative anchor offsets (dx_em, dy_lh) are small in
+        -- practice (< a few EMs), so a conservative constant pair
+        -- produces visually-stable translation. A future milestone may
+        -- refine this to query CRengine layout metrics directly.
+        local em_px, lh_px = 12, 20
+        local draw_translated_fn = function(g, tx, ty)
+            self:_drawStrokeTranslated(g, tx, ty)
+        end
+        local rotation_badge_fn = function(g)
+            self:_rotationBadgeRender(g)
+        end
+        for _, group in ipairs(self.annotation_groups) do
+            if group.anchor
+                    and self:getGroupCurrentPage(group) == page
+                    and not (stale_indices and group.stroke_indices
+                        and group.stroke_indices[1]
+                        and stale_indices[group.stroke_indices[1]]) then
+                StrokePaint.paint_with_anchor(group, self.ui.document,
+                    em_px, lh_px, draw_translated_fn, rotation_badge_fn)
+                anchor_owned = anchor_owned or {}
+                for _, idx in ipairs(group.stroke_indices or {}) do
+                    anchor_owned[idx] = true
+                end
+            end
+        end
+    end
+
     -- Render saved strokes for current page (skipping stale ones).
     local indices = self.page_strokes[page] or {}
     for _, idx in ipairs(indices) do
         if not (stale_indices and stale_indices[idx]) then
+            if not (anchor_owned and anchor_owned[idx]) then -- G2-M4
             local stroke = self.strokes[idx]
             if stroke then
                 self:renderStroke(bb, stroke)
             end
+            end -- G2-M4
         end
     end
 
@@ -4610,34 +4656,88 @@ end
 -- broadcasting DocumentRerendered, so no plugin-side setDirty is needed
 -- here (and would in fact be redundant — see the no-op
 -- onDocumentRerendered below).
+--
+-- G2-M4: each handler also clears the in-memory stroke-anchor cache
+-- (self._stroke_anchor_cache) so the next paintTo re-queries
+-- getScreenPositionFromXPointer against post-reflow positions instead
+-- of replaying stale screen coordinates. The cache is in-memory only;
+-- no new persisted field is introduced.
+function Pencil:_clearStrokeAnchorCache()
+    self._stroke_anchor_cache = nil
+end
+
+-- G2-M4: draw_translated_fn callback for lib/stroke_paint.
+-- The lib hands us (tx, ty) — the current-frame screen position where
+-- the anchor stroke's first point should land. We translate the whole
+-- group's strokes by the delta (tx - origin_x, ty - origin_y) via the
+-- existing renderStrokeOffset helper, which preserves all per-stroke
+-- visual properties (tool, width, colour, night-mode invert, etc.).
+function Pencil:_drawStrokeTranslated(group, tx, ty)
+    if not self._paint_bb then return end
+    if not group or not group.stroke_indices then return end
+    local first_idx = group.stroke_indices[1]
+    local first_stroke = first_idx and self.strokes[first_idx]
+    if not first_stroke or not first_stroke.points
+            or not first_stroke.points[1] then
+        return
+    end
+    local origin = first_stroke.points[1]
+    local dx = tx - origin.x
+    local dy = ty - origin.y
+    for _, idx in ipairs(group.stroke_indices) do
+        local s = self.strokes[idx]
+        if s then
+            self:renderStrokeOffset(self._paint_bb, s, dx, dy)
+        end
+    end
+end
+
+-- G2-M4: rotation_badge_fn callback for lib/stroke_paint. Routes to the
+-- EARNED rotation-badge path (Pencil:renderRotationBadge), threading
+-- the current paint blitbuffer captured at paintTo entry.
+function Pencil:_rotationBadgeRender(group)
+    if not self._paint_bb then return end
+    self:renderRotationBadge(self._paint_bb, group)
+end
+
 function Pencil:onSetDimensions()
     if self.ui and self.ui.view then
         pcall(self.ui.view.resetHighlightBoxesCache, self.ui.view)
     end
+    -- G2-M4: pre-reflow paint anchors are about to become stale.
+    self:_clearStrokeAnchorCache()
 end
 
 function Pencil:onSetFontSize()
     if self.ui and self.ui.view then
         pcall(self.ui.view.resetHighlightBoxesCache, self.ui.view)
     end
+    -- G2-M4: pre-reflow paint anchors are about to become stale.
+    self:_clearStrokeAnchorCache()
 end
 
 function Pencil:onSetFont()
     if self.ui and self.ui.view then
         pcall(self.ui.view.resetHighlightBoxesCache, self.ui.view)
     end
+    -- G2-M4: pre-reflow paint anchors are about to become stale.
+    self:_clearStrokeAnchorCache()
 end
 
 function Pencil:onSetLineSpace()
     if self.ui and self.ui.view then
         pcall(self.ui.view.resetHighlightBoxesCache, self.ui.view)
     end
+    -- G2-M4: pre-reflow paint anchors are about to become stale.
+    self:_clearStrokeAnchorCache()
 end
 
 function Pencil:onSetPageMargins()
     if self.ui and self.ui.view then
         pcall(self.ui.view.resetHighlightBoxesCache, self.ui.view)
     end
+    -- G2-M4: pre-reflow paint anchors are about to become stale.
+    self:_clearStrokeAnchorCache()
 end
 
 -- Post-reflow no-op (M7-REPAINT-LAG-FIX supersedes ca0e57e).
