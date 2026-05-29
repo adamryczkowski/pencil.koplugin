@@ -4570,6 +4570,19 @@ function Pencil:onReadSettings(config)
     end
 end
 
+-- Handle document re-render (rotation, font size/family, margins, line
+-- spacing, view mode). KOReader's ReaderView already resets its
+-- highlight-boxes cache on this event (readerview.lua:1217), but the
+-- visible repaint only happens on the next natural setDirty cycle —
+-- which can lag by several seconds. We force an immediate "ui" refresh
+-- of the view so Path-A highlights re-resolve via XPointer against the
+-- new layout without delay.
+function Pencil:onDocumentRerendered()
+    if self.view then
+        UIManager:setDirty(self.view, "ui")
+    end
+end
+
 -- Handle page changes (paging mode)
 function Pencil:onPageUpdate(pageno)
     -- Clear any in-progress stroke when page changes
