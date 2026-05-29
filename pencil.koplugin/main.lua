@@ -4570,17 +4570,80 @@ function Pencil:onReadSettings(config)
     end
 end
 
--- Handle document re-render (rotation, font size/family, margins, line
--- spacing, view mode). KOReader's ReaderView already resets its
--- highlight-boxes cache on this event (readerview.lua:1217), but the
--- visible repaint only happens on the next natural setDirty cycle —
--- which can lag by several seconds. We force an immediate "ui" refresh
--- of the view so Path-A highlights re-resolve via XPointer against the
--- new layout without delay.
-function Pencil:onDocumentRerendered()
-    if self.view then
-        UIManager:setDirty(self.view, "ui")
+-- Pre-reflow cache invalidation handlers (M7-REPAINT-LAG-FIX).
+--
+-- Root cause: ReaderView:resetHighlightBoxesCache is wired to the
+-- DocumentRerendered event (readerview.lua:1217), which fires only
+-- AFTER CRengine has finished reflowing. On a Kobo, reflow for a font
+-- size change or rotation can take ~5 seconds. During that window any
+-- redraw of saved Path-A annotations reads the stale highlight-boxes
+-- cache and paints highlights at their pre-reflow positions — the
+-- visible lag the operator reported.
+--
+-- Fix: subscribe to the events that fire BEFORE CRengine reflow and
+-- clear ReaderView's cache then. Any interim repaint during the
+-- reflow window now finds an empty cache, falls through to the
+-- pcall-guarded getScreenBoxesFromPositions call, and either gets
+-- fresh boxes or returns nil ("no draw" briefly is the correct
+-- intermediate state — see feature-plan.md §4 row 3).
+--
+-- Five KOReader events fire BEFORE the CRengine reflow call:
+--   SetDimensions   readerrolling.lua:1111  (rotation)
+--   SetFontSize     readerfont.lua:207      (font size change)
+--   SetFont         readerfont.lua:283+     (font family change)
+--   SetLineSpace    readerfont.lua:216      (line spacing change)
+--   SetPageMargins  readertypeset.lua:552   (margin change)
+--
+-- Each handler pcall-guards the KOReader call per the main.lua:3057-3068
+-- CRengine-boundary pattern. ReaderRolling already calls
+-- setDirty(view.dialog, 'partial') at readerrolling.lua:1059 right after
+-- broadcasting DocumentRerendered, so no plugin-side setDirty is needed
+-- here (and would in fact be redundant — see the no-op
+-- onDocumentRerendered below).
+function Pencil:onSetDimensions()
+    if self.ui and self.ui.view then
+        pcall(self.ui.view.resetHighlightBoxesCache, self.ui.view)
     end
+end
+
+function Pencil:onSetFontSize()
+    if self.ui and self.ui.view then
+        pcall(self.ui.view.resetHighlightBoxesCache, self.ui.view)
+    end
+end
+
+function Pencil:onSetFont()
+    if self.ui and self.ui.view then
+        pcall(self.ui.view.resetHighlightBoxesCache, self.ui.view)
+    end
+end
+
+function Pencil:onSetLineSpace()
+    if self.ui and self.ui.view then
+        pcall(self.ui.view.resetHighlightBoxesCache, self.ui.view)
+    end
+end
+
+function Pencil:onSetPageMargins()
+    if self.ui and self.ui.view then
+        pcall(self.ui.view.resetHighlightBoxesCache, self.ui.view)
+    end
+end
+
+-- Post-reflow no-op (M7-REPAINT-LAG-FIX supersedes ca0e57e).
+--
+-- The previous fix (ca0e57e) added a UIManager:setDirty(self.view, "ui")
+-- call here on the theory that the highlight layer needed an explicit
+-- nudge after reflow. That was incorrect: ReaderRolling already calls
+-- UIManager:setDirty(self.view.dialog, "partial") at
+-- readerrolling.lua:1059 immediately after broadcasting
+-- DocumentRerendered, and the actual stale-cache window is closed by
+-- the pre-reflow handlers above — not here. Keeping the named handler
+-- as a documented no-op so its absence doesn't surprise anyone reading
+-- the M7 history; if a real post-reflow action is needed in the
+-- future, this is the natural site for it.
+function Pencil:onDocumentRerendered()
+    -- Intentionally empty. See block comment above.
 end
 
 -- Handle page changes (paging mode)
