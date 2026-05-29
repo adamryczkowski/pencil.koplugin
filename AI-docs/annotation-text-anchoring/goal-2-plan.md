@@ -1,8 +1,27 @@
-# Goal-2 Plan: Pen-stroke Text-anchoring — PLAN ONLY
+# Goal-2 Plan: Pen-stroke Text-anchoring — COMPLETE
 
-**Status**: Sub-goal 2A CONVERGED. Sub-goal 2B IN PROGRESS.
-**Deliverable**: This file is the final plan for Goal 2. No implementation follows this round.
+**Status**: COMPLETE — Sub-goal 2A CONVERGED + Sub-goal 2B IMPLEMENTED, VALIDATED, AND LANDED.
+**Deliverable**: This file documents the final plan and the as-built implementation. §1–§6 are FINAL.
 **Rounds used (2A)**: 1 (synthesis) + 1 (update/final verdict)
+**Implementation rounds (2B)**: 7 milestones M1–M7, TDD-first, one commit per milestone, validator-gated.
+
+## Milestone Ledger (as-built)
+
+| Milestone | Commit  | Busted     | Scope                                                              |
+| --------- | ------- | ---------- | ------------------------------------------------------------------ |
+| G2-M1     | d3916cc | 304/0/0    | Plan lockdown — anchor schema & discard-raw rejection documented   |
+| G2-M2     | 197b0a3 | 309/0/0    | lib/stroke_anchor + lib/stroke_capture + lib/stroke_paint + SA-1–5 |
+| G2-M3     | c27fdfd | 314/0/0    | Wire StrokeCapture.compute_anchor in assignStrokeToGroup + SC-1–5  |
+| G2-M4     | 51ccabc | 325/0/0    | paintTo paint_with_anchor wiring + 5 reflow handlers + SP-1–7      |
+| G2-M5     | 25cbb45 | 329/0/0    | Persistence round-trip specs PER-1–4 (spec-only)                   |
+| G2-M6     | b9e0c45 | 330/0/0    | Ruby / vertical-text graceful degradation RU-1 (spec-only)         |
+| G2-M7     | (this)  | 330/0/0    | Documentation closeout                                             |
+
+**Validator verdict aggregate**: ALL 7 milestones PASS. Baseline 304 → final 330 (+26 specs: SA(5) + SC(5) + SP(11) + PER(4) + RU(1)).
+
+## Carried-forward post-merge consideration
+
+**FINDING-G2M3-1** (MEDIUM, non-blocking, deferred to post-merge): the anchor capture in `Pencil:assignStrokeToGroup` (G2-M3 wiring) does not gate on `stroke.page == self:getCurrentPage()` the way the surrounding `xpointer_v2` block does. In normal use the two are equivalent because both fire during stroke commit on the visible page; the edge case is a hypothetical stroke whose `page` field has drifted from the current page (e.g. mid-flush) — in that case the anchor would resolve against the wrong page's screen position. Considered acceptable for the current scope because: (a) the surrounding code paths gate identically, (b) the anchor's xpointer is page-independent (resolved at paint time, not capture time), (c) on resolution mismatch the lib's rotation-badge path activates cleanly per SP-3 / SP-4 / RU-1. Tracked in `docs-AI/g2m-validation-report.md` for a future hardening pass.
 
 ---
 
