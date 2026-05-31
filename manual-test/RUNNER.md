@@ -51,7 +51,7 @@ These bindings are reused by every test run — set them once.
 ### 3. Probe the device
 
 ```bash
-cd AI-docs/annotation-text-anchoring/manual-test
+cd manual-test
 ./bin/detect-device.sh <KOBO-IP>
 ```
 

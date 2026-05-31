@@ -1,1 +1,8 @@
 /.claude
+
+# AI/orchestrator workspace — planning artefacts, agent state, generated
+# process docs. Treated as scratch; the canonical project docs live in
+# docs/ and source-code comments.
+/AI-docs/
+/docs-AI/
+/state/

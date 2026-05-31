@@ -89,7 +89,7 @@ the right answer. Mentioned only as a "if all else fails" lifeline.
 ## Wiring into this conversation
 
 When you have screenshots locally, either:
-- **Drop them in `AI-docs/annotation-text-anchoring/manual-test/run-N/`**
+- **Drop them in `manual-test/run-N/`**
   (create the folder per test run; `N` = run number) and tell me the path.
   I will `Read` each file by name.
 - **Or attach individual photos** to your message and I will look at them
