@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# Take a screenshot on the Kobo and pull it to <out-path>.
+# Steps: tap top-left corner (bound to Screenshot action) → wait for write
+#        → scp newest screenshot → rename.
+#
+# Usage: snap <out-path>
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "${HERE}/../device.env"
+
+OUT="${1:?usage: snap <out-path>}"
+mkdir -p "$(dirname "$OUT")"
+
+SSHOPTS=(-p "$KOBO_PORT"
+         -o "ControlMaster=auto"
+         -o "ControlPath=${KOBO_SSH_CTRL}"
+         -o "ControlPersist=60s"
+         -o "ConnectTimeout=5")
+SCPOPTS=(-P "$KOBO_PORT"
+         -o "ControlMaster=auto"
+         -o "ControlPath=${KOBO_SSH_CTRL}"
+         -o "ControlPersist=60s")
+
+# 1. Trigger.
+"${HERE}/kobo-tap" tl
+
+# 2. Wait for KOReader to finish writing the PNG.
+#    (Screenshoter renders the bb to PNG synchronously; 1.5 s is generous.)
+sleep 1.5
+
+# 3. Find the newest screenshot.
+LATEST=$(ssh "${SSHOPTS[@]}" "${KOBO_USER}@${KOBO_HOST}" \
+  "ls -t ${KOBO_SCREENSHOT_DIR}/Screenshot_*.png 2>/dev/null | head -1") || true
+
+if [ -z "$LATEST" ]; then
+  echo "ERROR: no screenshot found in ${KOBO_SCREENSHOT_DIR}/" >&2
+  echo "Did the tl corner-tap fire? Check the gesture binding (Tools → Gesture Manager → Tap → Top-left corner → Screenshot)." >&2
+  exit 1
+fi
+
+# 4. Pull and rename.
+scp -q "${SCPOPTS[@]}" "${KOBO_USER}@${KOBO_HOST}:${LATEST}" "$OUT"
+echo "snap → $OUT  (src: $LATEST)"

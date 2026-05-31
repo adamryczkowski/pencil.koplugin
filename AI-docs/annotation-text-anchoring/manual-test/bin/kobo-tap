@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# Inject one corner-tap into the Kobo touchscreen.
+# Usage: kobo-tap <tl|tr|bl|br|ttl|ttr|tbl|tbr>
+#   t* = single-finger tap. tt* = two-finger tap.
+#
+# Relies on ../device.env (run bin/detect-device.sh first).
+# Two SSH round-trips per tap (down + sleep + up) — kept fast by ControlMaster.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "${HERE}/../device.env"
+
+CORNER="${1:?usage: kobo-tap <tl|tr|bl|br|ttl|ttr|tbl|tbr>}"
+
+W="$KOBO_SCREEN_W"
+H="$KOBO_SCREEN_H"
+M="$KOBO_TAP_MARGIN"
+
+case "$CORNER" in
+  tl|ttl)  X=$M;          Y=$M ;;
+  tr|ttr)  X=$((W - M));  Y=$M ;;
+  bl|tbl)  X=$M;          Y=$((H - M)) ;;
+  br|tbr)  X=$((W - M));  Y=$((H - M)) ;;
+  *) echo "bad corner: $CORNER (want one of tl tr bl br ttl ttr tbl tbr)" >&2
+     exit 1 ;;
+esac
+
+TWO=0
+case "$CORNER" in ttl|ttr|tbl|tbr) TWO=1 ;; esac
+
+SSHOPTS=(-p "$KOBO_PORT"
+         -o "ControlMaster=auto"
+         -o "ControlPath=${KOBO_SSH_CTRL}"
+         -o "ControlPersist=60s"
+         -o "ConnectTimeout=5")
+
+GEN="${HERE}/mt-tap-events.py"
+
+# Phase 1: touch DOWN
+python3 "$GEN" "$X" "$Y" "$TWO" down "$KOBO_EVDEV_FMT" \
+  | ssh "${SSHOPTS[@]}" "${KOBO_USER}@${KOBO_HOST}" "cat > ${KOBO_TOUCH_DEV}"
+
+# Hold ~80 ms (enough for KOReader's gesture detector to register a tap)
+sleep 0.08
+
+# Phase 2: touch UP
+python3 "$GEN" "$X" "$Y" "$TWO" up "$KOBO_EVDEV_FMT" \
+  | ssh "${SSHOPTS[@]}" "${KOBO_USER}@${KOBO_HOST}" "cat > ${KOBO_TOUCH_DEV}"

@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN"
+  "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head><title>Ch.4 Margin / fallback</title><link rel="stylesheet" type="text/css" href="styles.css"/></head>
+<body>
+<h1>Chapter 4 &mdash; Margin gutter (anchor-miss fallback)</h1>
+<p class="note">Use this chapter to verify the EARNED rotation-badge fallback. Draw a stroke ENTIRELY inside the left/right gutter (off any text). On reflow, it should display the rotation badge rather than translate.</p>
+<p>This chapter intentionally has wide gutters. The text below leaves room on either side for a "margin stroke" that will not anchor to any word.</p>
+<p>Anchor-miss path: capture-time both <code>getWordFromPosition</code> and <code>getNearestWordAndBoxFromPosition</code> return nil, so <code>group.anchor=nil</code> is persisted. At paint, the rotation-badge fallback at <code>main.lua:4239-4311</code> activates instead of translation.</p>
+<p>A short page so it is easy to land back here after rotation.</p>
+</body></html>

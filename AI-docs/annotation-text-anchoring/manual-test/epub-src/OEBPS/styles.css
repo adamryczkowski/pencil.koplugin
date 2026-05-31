@@ -1,0 +1,6 @@
+body { margin: 1em; font-family: serif; }
+h1 { font-size: 1.4em; margin: 0.5em 0 0.8em 0; }
+p  { margin: 0.4em 0; line-height: 1.4; }
+.mk { font-family: monospace; font-weight: bold; }
+.note { font-style: italic; color: #444; }
+.tall { line-height: 2.0; }
