@@ -54,28 +54,39 @@ function StrokeCapture.compute_anchor(doc, stroke_pt)
     end
 
     -- Step 1: strict inverse lookup.
-    -- build-compat: CreDocument:getWordFromPosition (credocument.lua:605)
-    -- The 3rd arg `do_not_draw_selection=true` is mandatory at capture
-    -- time — Goal-1 Path-A's main.lua:907 call does NOT pass true; Goal-2
-    -- MUST differ (R1, RTM-5). SC-4 is the explicit regression guard.
+    -- build-compat: CreDocument:getWordFromPosition (credocument.lua:605).
+    -- Returns {word, sbox, pos0, pos1} on hit — NOT {xpointer, pos}.
+    -- The 3rd arg `do_not_draw_selection=true` suppresses the marker-paint
+    -- side effect at capture time (R1, RTM-5, SC-4 regression guard).
     local ok1, word = pcall(doc.getWordFromPosition, doc, stroke_pt, true)
-    if ok1 and type(word) == "table" then
-        local lh = (word.pos and word.pos.h) or 20
+    if ok1 and type(word) == "table" and word.pos0 and word.sbox then
+        local lh = word.sbox.h or 20
+        local normalized = { xpointer = word.pos0, pos = word.sbox }
         local anchor = StrokeAnchor.compute_line_anchor(
-            word, stroke_pt, lh * 0.6, lh)
-        if anchor then return anchor end
+            normalized, stroke_pt, lh * 0.6, lh)
+        if anchor then
+            -- Remember the capture-time line-height so paint can compute
+            -- the stroke-size scale ratio (lh_paint / lh_capture).
+            anchor.lh_capture = lh
+            return anchor
+        end
     end
 
     -- Step 2: fuzzy inverse lookup.
     -- build-compat: CreDocument:getNearestWordAndBoxFromPosition
-    -- (credocument.lua:719-744). DIR_ANY = 0 = whole-page search.
+    -- (credocument.lua:719-744). Returns same shape as Step 1.
+    -- DIR_ANY = 0 = whole-page search.
     local ok2, nearest = pcall(
         doc.getNearestWordAndBoxFromPosition, doc, stroke_pt, 0)
-    if ok2 and type(nearest) == "table" then
-        local lh = (nearest.pos and nearest.pos.h) or 20
+    if ok2 and type(nearest) == "table" and nearest.pos0 and nearest.sbox then
+        local lh = nearest.sbox.h or 20
+        local normalized = { xpointer = nearest.pos0, pos = nearest.sbox }
         local anchor = StrokeAnchor.compute_line_anchor(
-            nearest, stroke_pt, lh * 0.6, lh)
-        if anchor then return anchor end
+            normalized, stroke_pt, lh * 0.6, lh)
+        if anchor then
+            anchor.lh_capture = lh
+            return anchor
+        end
     end
 
     -- Step 3: nil anchor — image-only / no-text / vertical-text-miss.

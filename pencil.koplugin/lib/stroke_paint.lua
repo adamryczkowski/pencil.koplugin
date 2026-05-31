@@ -65,10 +65,19 @@ function StrokePaint.paint_with_anchor(group, doc, em_px, lh_px,
             doc.getScreenPositionFromXPointer, doc, group.anchor.xp)
         if ok and screen_y ~= nil then
             if screen_y >= 0 then
-                -- (A) anchor hit → translate verbatim stroke
+                -- (A) anchor hit → translate (and optionally scale) the stroke
                 local tx, ty = StrokeAnchor.resolve_anchor_delta(
                     group.anchor, screen_x, screen_y, em_px, lh_px)
-                draw_translated_fn(group, tx, ty)
+                -- Scale strokes proportionally to line-height change between
+                -- capture and paint. Strokes captured before this field was
+                -- added (lh_capture nil) keep their original size (scale=1).
+                local scale = 1.0
+                if group.anchor.lh_capture
+                        and type(group.anchor.lh_capture) == "number"
+                        and group.anchor.lh_capture > 0 then
+                    scale = lh_px / group.anchor.lh_capture
+                end
+                draw_translated_fn(group, tx, ty, scale)
                 return
             else
                 -- (B) off-screen (prior virtual page) → silent clip.

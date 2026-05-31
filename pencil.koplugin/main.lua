@@ -3237,10 +3237,16 @@ function Pencil:assignStrokeToGroup(stroke_idx, skip_bookmark)
         -- (lib/stroke_capture.lua). Independent of xpointer_v2 above; nil
         -- on image-only pages / off-current-page strokes / vertical-text
         -- miss → paint-time rotation-badge path (main.lua:4239-4311).
+        -- Stroke points are in SCREEN coords; CRengine's getWordFromPosition
+        -- expects PAGE coords. Mirror the conversion main.lua:915 uses for
+        -- Goal-1's text-highlight call.
         local stroke_start_pt = stroke.points and stroke.points[1]
-        if stroke_start_pt then
-            group.anchor = StrokeCapture.compute_anchor(
-                self.ui.document, stroke_start_pt)
+        if stroke_start_pt and self.ui.view then
+            local page_pt = self.ui.view:screenToPageTransform(stroke_start_pt)
+            if page_pt then
+                group.anchor = StrokeCapture.compute_anchor(
+                    self.ui.document, page_pt)
+            end
         end
         table.insert(self.annotation_groups, group)
         if not skip_bookmark then
@@ -4268,6 +4274,11 @@ function Pencil:paintTo(bb, x, y)
                 -- Renders natively (same rotation as capture, or legacy group
                 -- without rotation info — render strokes as-is).
                 has_native_annotation = true
+            elseif group.anchor then
+                -- Goal-2: has a line-relative anchor; the anchor pass below
+                -- will render it (translate, silent-clip, or fallback to
+                -- badge via StrokePaint). Skip the stale-badge bookkeeping
+                -- — otherwise the stale-check blocks the anchor pass.
             elseif group.image_path then
                 stale_groups = stale_groups or {}
                 stale_groups[#stale_groups + 1] = group
@@ -4317,24 +4328,20 @@ function Pencil:paintTo(bb, x, y)
     -- (added wrapping anchor_owned check, no existing line modified).
     local anchor_owned = nil
     if self.annotation_groups and self.ui and self.ui.document then
-        -- Heuristic em / lh in pixels for paint-time delta scaling. The
-        -- EM-relative anchor offsets (dx_em, dy_lh) are small in
-        -- practice (< a few EMs), so a conservative constant pair
-        -- produces visually-stable translation. A future milestone may
-        -- refine this to query CRengine layout metrics directly.
-        local em_px, lh_px = 12, 20
-        local draw_translated_fn = function(g, tx, ty)
-            self:_drawStrokeTranslated(g, tx, ty)
+        local draw_translated_fn = function(g, tx, ty, scale)
+            self:_drawStrokeTranslated(g, tx, ty, scale)
         end
         local rotation_badge_fn = function(g)
             self:_rotationBadgeRender(g)
         end
         for _, group in ipairs(self.annotation_groups) do
             if group.anchor
-                    and self:getGroupCurrentPage(group) == page
-                    and not (stale_indices and group.stroke_indices
-                        and group.stroke_indices[1]
-                        and stale_indices[group.stroke_indices[1]]) then
+                    and self:getGroupCurrentPage(group) == page then
+                -- Derive em / lh from the actual on-screen line box of
+                -- the anchor's xpointer, so paint-time scaling matches
+                -- capture-time scaling regardless of font size / rotation.
+                -- Falls back to the prior heuristic if the query fails.
+                local em_px, lh_px = self:_getAnchorMetrics(group.anchor.xp)
                 StrokePaint.paint_with_anchor(group, self.ui.document,
                     em_px, lh_px, draw_translated_fn, rotation_badge_fn)
                 anchor_owned = anchor_owned or {}
@@ -4666,13 +4673,41 @@ function Pencil:_clearStrokeAnchorCache()
     self._stroke_anchor_cache = nil
 end
 
+-- Query the line-height (and derived em) of the line containing the given
+-- xpointer, in current-screen pixel units. Used by paintTo's anchor pass so
+-- that the dx_em / dy_lh offsets stored at capture-time scale correctly
+-- against the same line at any future rotation / font size.
+--
+-- Falls back to a conservative (12, 20) pair if the engine query fails —
+-- same heuristic the pre-fix paintTo always used.
+function Pencil:_getAnchorMetrics(xp)
+    if not (self.ui and self.ui.document
+            and self.ui.document.getScreenBoxesFromPositions) then
+        return 12, 20
+    end
+    -- getScreenBoxesFromPositions needs a non-zero range to return a box.
+    -- Construct the xpointer one character forward by incrementing the
+    -- trailing ".N" text-node offset (CRengine xpointer format).
+    local xp_end = xp:gsub("(%.)(%d+)$", function(d, n)
+        return d .. tostring(tonumber(n) + 1)
+    end)
+    local ok, boxes = pcall(self.ui.document.getScreenBoxesFromPositions,
+        self.ui.document, xp, xp_end, true)
+    if ok and type(boxes) == "table" and boxes[1]
+            and type(boxes[1].h) == "number" and boxes[1].h > 0 then
+        local lh = boxes[1].h
+        return lh * 0.6, lh
+    end
+    return 12, 20
+end
+
 -- G2-M4: draw_translated_fn callback for lib/stroke_paint.
 -- The lib hands us (tx, ty) — the current-frame screen position where
 -- the anchor stroke's first point should land. We translate the whole
 -- group's strokes by the delta (tx - origin_x, ty - origin_y) via the
 -- existing renderStrokeOffset helper, which preserves all per-stroke
 -- visual properties (tool, width, colour, night-mode invert, etc.).
-function Pencil:_drawStrokeTranslated(group, tx, ty)
+function Pencil:_drawStrokeTranslated(group, tx, ty, scale)
     if not self._paint_bb then return end
     if not group or not group.stroke_indices then return end
     local first_idx = group.stroke_indices[1]
@@ -4682,12 +4717,37 @@ function Pencil:_drawStrokeTranslated(group, tx, ty)
         return
     end
     local origin = first_stroke.points[1]
-    local dx = tx - origin.x
-    local dy = ty - origin.y
-    for _, idx in ipairs(group.stroke_indices) do
-        local s = self.strokes[idx]
-        if s then
-            self:renderStrokeOffset(self._paint_bb, s, dx, dy)
+    scale = scale or 1.0
+    if scale == 1.0 then
+        -- Fast path: pure translation, no per-point math.
+        local dx = tx - origin.x
+        local dy = ty - origin.y
+        for _, idx in ipairs(group.stroke_indices) do
+            local s = self.strokes[idx]
+            if s then
+                self:renderStrokeOffset(self._paint_bb, s, dx, dy)
+            end
+        end
+    else
+        -- Scale every point around the stroke's first-point (origin), then
+        -- translate the resulting origin to (tx, ty). Equivalent to rendering
+        -- a transformed stroke; we materialize one because renderStroke takes
+        -- a stroke table (cheaper than adding a new render entry-point).
+        for _, idx in ipairs(group.stroke_indices) do
+            local s = self.strokes[idx]
+            if s and s.points then
+                local transformed = {}
+                for k, v in pairs(s) do transformed[k] = v end
+                transformed.points = {}
+                for i, p in ipairs(s.points) do
+                    transformed.points[i] = {
+                        x = tx + (p.x - origin.x) * scale,
+                        y = ty + (p.y - origin.y) * scale,
+                    }
+                end
+                if s.width then transformed.width = s.width * scale end
+                self:renderStroke(self._paint_bb, transformed)
+            end
         end
     end
 end

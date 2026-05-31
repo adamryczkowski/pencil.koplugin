@@ -48,9 +48,16 @@ local function make_doc(opts)
     return doc
 end
 
+-- VALID_WORD shape MUST match the real CreDocument:getWordFromPosition return
+-- shape (credocument.lua:605-680): a wordbox with .pos0 (xpointer of the
+-- text-range start) and .sbox (Geom screen-box). Earlier versions of this
+-- spec used hypothetical fields `xpointer`/`pos` that don't exist on the
+-- real API — the mock-vs-prod divergence let the Goal-2 wiring ship broken.
 local VALID_WORD = {
-    xpointer = "/body/DocFragment[1]/p[3]/text()",
-    pos = { x = 50, y = 100, w = 200, h = 20 },
+    word = "anchor",
+    pos0 = "/body/DocFragment[1]/p[3]/text()",
+    pos1 = "/body/DocFragment[1]/p[3]/text().6",
+    sbox = { x = 50, y = 100, w = 200, h = 20 },
 }
 
 describe("StrokeCapture.compute_anchor", function()
@@ -62,7 +69,7 @@ describe("StrokeCapture.compute_anchor", function()
         assert.is_not_nil(anchor)
         assert.equals("line", anchor.type)
         assert.equals("string", type(anchor.xp))
-        assert.equals(VALID_WORD.xpointer, anchor.xp)
+        assert.equals(VALID_WORD.pos0, anchor.xp)
     end)
 
     it("SC-2: strict pcall raises → falls to fuzzy → anchor non-nil if fuzzy returns valid", function()
@@ -74,7 +81,7 @@ describe("StrokeCapture.compute_anchor", function()
         local anchor = StrokeCapture.compute_anchor(doc, stroke_pt)
         assert.is_not_nil(anchor)
         assert.equals("line", anchor.type)
-        assert.equals(VALID_WORD.xpointer, anchor.xp)
+        assert.equals(VALID_WORD.pos0, anchor.xp)
         -- Both methods consulted in order:
         assert.equals("getWordFromPosition",  doc.calls[1].method)
         assert.equals("getNearestWordAndBoxFromPosition", doc.calls[2].method)

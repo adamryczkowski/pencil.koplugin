@@ -262,18 +262,24 @@ describe("SP-7 multi-line stroke anchors to start-line", function()
 
     -- Mock doc whose word lookups discriminate by y so we can prove the
     -- start-line (not end-line) won.
+    -- Mock matches the real CreDocument:getWordFromPosition shape:
+    -- {word, sbox, pos0, pos1} — see credocument.lua:605-680.
     local function make_capture_doc()
         return {
             getWordFromPosition = function(self, pos, do_not_draw_selection)
                 if pos.y <= 150 then
                     return {
-                        xpointer = "x/top-line",
-                        pos = { x = 20, y = 100, w = 200, h = 20 },
+                        word = "top",
+                        pos0 = "x/top-line",
+                        pos1 = "x/top-line.3",
+                        sbox = { x = 20, y = 100, w = 200, h = 20 },
                     }
                 elseif pos.y >= 350 then
                     return {
-                        xpointer = "x/bottom-line",
-                        pos = { x = 20, y = 400, w = 200, h = 20 },
+                        word = "bot",
+                        pos0 = "x/bottom-line",
+                        pos1 = "x/bottom-line.3",
+                        sbox = { x = 20, y = 400, w = 200, h = 20 },
                     }
                 end
                 return nil
