@@ -22,6 +22,7 @@ local DispatchPredicate = require("lib/dispatch_predicate")
 local HighlightColorWiring = require("lib/highlight_color_wiring")
 local SettingsDefaults = require("lib/settings_defaults")
 local StrokeCapture = require("lib/stroke_capture")
+local StrokeCluster = require("lib/stroke_cluster")
 local StrokePaint = require("lib/stroke_paint")
 local Screen = Device.screen
 local Size = require("ui/size")
@@ -215,6 +216,14 @@ function Pencil:init()
     self.annotation_groups = {}  -- Annotation groups for bookmark integration
     self.strokes_loaded = false  -- Set true after successful loadStrokes
     self.undo_stack = {}
+    -- Goal-3: transient cluster state for the 1.2s explicit-anchor capture
+    -- window (lib/stroke_cluster.lua). _current_cluster is the open
+    -- cluster being accumulated; _closed_clusters is the FIFO of
+    -- finalized clusters awaiting heuristic consumption (G3-M3). Both
+    -- are transient — never persisted to the sidecar.
+    self._current_cluster = nil
+    self._closed_clusters = {}
+    self._cluster_close_timer_handle = nil
 
     -- Calculate gray value from highlight_lighten_factor setting
     local lighten_factor = G_reader_settings:readSetting("highlight_lighten_factor") or 0.2
@@ -850,6 +859,13 @@ function Pencil:endRawStroke()
         self:indexStroke(#self.strokes, self.current_stroke.page)
         table.insert(self.undo_stack, { type = "add", stroke_idx = #self.strokes })
         self:assignStrokeToGroup(#self.strokes)
+        -- Goal-3 G3-M2: route the just-saved stroke through the cluster
+        -- state machine and (re)start the 1.2s cluster-close timer. The
+        -- timer callback finalizes the cluster and parks it on
+        -- self._closed_clusters; the heuristic (G3-M3) drains that
+        -- queue. This is purely additive — assignStrokeToGroup's Goal-2
+        -- grouping path is untouched.
+        self:_routeStrokeToCluster(#self.strokes)
         self:scheduleDeferredWork()
         if self.input_debug_mode then
             self:writeDebugLog(string.format("endRawStroke: SAVED stroke #%d with %d points, total strokes=%d",
@@ -864,6 +880,107 @@ function Pencil:endRawStroke()
     self.current_stroke = nil
     -- Schedule delayed refresh for clean display after writing stops
     self:scheduleDelayedRefresh()
+end
+
+-- ------------------------------------------------------------------
+-- Goal-3 G3-M2: cluster-close timer wiring.
+-- These three methods own the transient cluster state used by the
+-- explicit-anchor capture pipeline. They are additive to the Goal-2
+-- annotation_groups path (assignStrokeToGroup, 10s/200px loose
+-- grouping) and never touch the persisted sidecar — only transient
+-- self._current_cluster / self._closed_clusters fields.
+-- ------------------------------------------------------------------
+
+-- Convert the existing stroke record (with .datetime in seconds and
+-- .points to recompute bbox from) into the {bbox,t_ms,page} shape
+-- that lib/stroke_cluster.lua consumes. Pure helper; no UI side
+-- effects.
+function Pencil:_strokeRecordForCluster(stroke_idx)
+    local stroke = self.strokes[stroke_idx]
+    if not stroke then return nil end
+    local bbox = PencilGeometry.computeStrokeBbox(stroke)
+    if not bbox then return nil end
+    -- stroke.datetime is os.time() (seconds, integer); convert to ms
+    -- for compatibility with CLUSTER_CLOSE_TIMEOUT_MS. Sub-second
+    -- precision isn't available from os.time(), but the comparison
+    -- is still sound at integer-second resolution for the 1.2s
+    -- window (two strokes inside the same second can both join).
+    local t_ms = (stroke.datetime or os.time()) * 1000
+    return {
+        bbox = bbox,
+        t_ms = t_ms,
+        page = stroke.page,
+        idx  = stroke_idx,
+    }
+end
+
+-- Route a just-finalized stroke into the cluster state machine.
+-- Called from endRawStroke after assignStrokeToGroup.
+function Pencil:_routeStrokeToCluster(stroke_idx)
+    local rec = self:_strokeRecordForCluster(stroke_idx)
+    if not rec then return end
+
+    -- Close the open cluster if (a) too much time has elapsed since
+    -- its last stroke or (b) this stroke is spatially / page-disjoint
+    -- from the cluster's bbox. Either branch finalizes the existing
+    -- cluster onto the closed queue and starts a fresh one.
+    if self._current_cluster then
+        local timed_out = StrokeCluster.should_close(self._current_cluster, rec.t_ms)
+        local disjoint  = not StrokeCluster.should_join(self._current_cluster, rec)
+        if timed_out or disjoint then
+            table.insert(self._closed_clusters,
+                StrokeCluster.finalize(self._current_cluster))
+            self._current_cluster = nil
+        end
+    end
+    if not self._current_cluster then
+        self._current_cluster = StrokeCluster.new()
+    end
+    StrokeCluster.add_stroke(self._current_cluster, rec)
+
+    -- (Re)start the 1.2s cluster-close timer.
+    self:_resetClusterCloseTimer()
+end
+
+-- (Re)schedule the cluster-close timer using KOReader's UIManager.
+-- Any pending timer is cancelled first so back-to-back strokes
+-- extend the window rather than firing concurrent timeouts.
+function Pencil:_resetClusterCloseTimer()
+    if self._cluster_close_timer_handle then
+        pcall(UIManager.unschedule, UIManager, self._cluster_close_timer_handle)
+        self._cluster_close_timer_handle = nil
+    end
+    local pencil = self
+    self._cluster_close_timer_handle = function()
+        pencil:_onClusterCloseTimeout()
+    end
+    -- StrokeCluster.CLUSTER_CLOSE_TIMEOUT_MS is in milliseconds;
+    -- UIManager:scheduleIn takes seconds (fractional).
+    pcall(UIManager.scheduleIn, UIManager,
+        StrokeCluster.CLUSTER_CLOSE_TIMEOUT_MS / 1000,
+        self._cluster_close_timer_handle)
+end
+
+-- Fired ~1.2s after the most recent stroke. Finalizes the current
+-- cluster onto the closed queue for consumption by the heuristic
+-- (G3-M3). Defensively re-checks should_close in case a new stroke
+-- arrived between scheduling and firing (which would have called
+-- _resetClusterCloseTimer to cancel us, but pcall on unschedule
+-- means we tolerate the race).
+function Pencil:_onClusterCloseTimeout()
+    self._cluster_close_timer_handle = nil
+    if not self._current_cluster then return end
+    local now_ms = os.time() * 1000
+    if StrokeCluster.should_close(self._current_cluster, now_ms) then
+        self._closed_clusters = self._closed_clusters or {}
+        table.insert(self._closed_clusters,
+            StrokeCluster.finalize(self._current_cluster))
+        self._current_cluster = nil
+    else
+        -- A fresh stroke arrived during the race window; the cluster
+        -- is still open. Re-arm the timer for the new t_last.
+        self:_resetClusterCloseTimer()
+    end
 end
 
 -- Paint the in-progress text selection as "invert" rectangles while a
