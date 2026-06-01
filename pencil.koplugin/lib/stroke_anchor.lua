@@ -9,10 +9,12 @@ threads a `word_result` (returned by `CreDocument:getWordFromPosition` or
 `getNearestWordAndBoxFromPosition`) in. This is what makes the module
 busted-testable without requiring `main`.
 
-Schema (Goal-2 plan §1, LOCKED):
+----------------------------------------------------------------------
+Schema (Goal-2 plan §1, LOCKED) — owns the `"line"` anchor variant
+----------------------------------------------------------------------
 
     group.anchor = {
-        type  = "line",            -- only valid value in this PR
+        type  = "line",            -- this module's owned variant
         xp    = "<xpointer>",      -- line xpointer at stroke start-point
         dx_em = <float>,           -- horizontal offset in em units
         dy_lh = <float>,           -- vertical offset in line-height units
@@ -24,6 +26,109 @@ anchor-miss at capture (rotation-badge path at paint time).
 OQ-3 LOCKED in plan §2 G2-M2:
     lh_px = word_result.pos.h
     em_px = word_result.pos.h * 0.6
+
+----------------------------------------------------------------------
+4-value anchor.type dispatcher (Goal-3 schema lockdown, G3-M1)
+----------------------------------------------------------------------
+
+Goal-3 extends `group.anchor` from a 2-value contract (nil | "line")
+to a 4-value contract. This module remains the sole owner of the
+`"line"` variant; the three other variants live in their own modules:
+
+    anchor.type    Path                                  Module owner
+    -----------    -----                                 ------------
+    nil            legacy → rotation-badge EARNED        (Goal-2 back-
+                   (main.lua:4239-4311 byte-identical)    compat; no
+                                                          per-type
+                                                          module)
+    "line"         Goal-2 implicit line-relative anchor  THIS module
+                   (xp, dx_em, dy_lh — see schema above) (lib/stroke_anchor)
+    "explicit"     Goal-3 EPUB cluster anchor (xp +      lib/stroke_capture
+                   cluster_bbox + connector_geom +       (capture)
+                   scale + free_spot_history +           lib/stroke_paint
+                   clarified)                            (render)
+                                                          lib/manual_anchor
+                                                          (state machine)
+    "pdf_page"     Goal-3 PDF page-anchor                lib/pdf_anchor
+                   (page integer only)                   (capture)
+                                                          lib/stroke_paint
+                                                          (render)
+
+----------------------------------------------------------------------
+"explicit" anchor record schema (G3-M4 paint, G3-M2/M3 capture)
+----------------------------------------------------------------------
+
+    group.anchor = {
+        type              = "explicit",
+        xp                = <xpointer_string>,    -- anchor text line xpointer
+                                                   -- (nil only on MA-6 orphan
+                                                   --  sentinel — escape hatch)
+        cluster_bbox      = { x, y, w, h },       -- cluster bbox at capture
+                                                   -- (screen px)
+        connector_geom    = { x0, y0, x1, y1 },   -- connector endpoints
+                                                   -- (screen px; updated on
+                                                   --  reflow)
+        scale             = <float 0.5..1.0>,     -- current scale factor
+        free_spot_history = { layout_key,         -- single-record layout
+                              x_em, y_lh, scale }, -- cache (cap=1)
+        clarified         = <bool>,               -- false ⇒ ambiguity prompt
+                                                   -- active; true ⇒ resolved
+    }
+
+----------------------------------------------------------------------
+"pdf_page" anchor record schema (G3-M7 capture + render)
+----------------------------------------------------------------------
+
+    group.anchor = {
+        type = "pdf_page",
+        page = <integer>,           -- 1-based page number at capture time
+    }
+
+PDF strokes render at saved pixel coordinates on the matching page.
+No heuristic, no connector, no exclamation, no auto-layout. Atomic
+delete still applies (eraser-tap removes the annotation group only —
+no highlight, no connector to remove). PDFs do not reflow, so
+rotation survival is NOT a DoD requirement for the PDF path.
+
+----------------------------------------------------------------------
+Stale-rotation filter explicit type guard (G3-M4 wiring)
+----------------------------------------------------------------------
+
+The earned rotation-badge filter at main.lua:4247-4296 stays
+byte-identical for `nil` and `"line"` groups (Goal-2 hard
+constraint). G3-M4 adds a 2-line guard above the filter so that
+`"explicit"` and `"pdf_page"` groups bypass it and reach the
+draw step unchanged:
+
+    if group.anchor
+        and (group.anchor.type == "explicit"
+             or group.anchor.type == "pdf_page") then
+        goto skip_stale_filter
+    end
+
+Spec PT-6 (G3-M4) is the regression guard: an `"explicit"` group
+with a stale rotation tag must still reach stroke draw.
+
+----------------------------------------------------------------------
+Render-op ordering invariant (LOCKED in G3-M4)
+----------------------------------------------------------------------
+
+    highlight_underline  <  stroke  <  exclamation  <  badge
+
+Underline drawn first so ink sits on top; exclamation second-to-last
+so it stays visible on top of strokes; badge last so the legacy
+fallback marker stays visible when present.
+
+----------------------------------------------------------------------
+Named-constants surface
+----------------------------------------------------------------------
+
+All 18 numeric tuning values (paint primitives, hue triples, timing
+windows, scale ratios) live in `lib/anchor_constants.lua` per
+operator hard-constraint #5. This module does not define numeric
+literals beyond the OQ-3 `* 0.6` em-from-lh ratio (LOCKED in Goal-2
+§2 G2-M2; not a tunable constant — derived from CRengine word-box
+geometry).
 
 @module pencil.lib.stroke_anchor
 --]]--
