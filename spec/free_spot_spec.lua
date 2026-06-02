@@ -1,10 +1,12 @@
 --[[--
-Unit tests for lib/free_spot — L2 margin-preference auto-layout pass.
+Unit tests for lib/free_spot — L2 margin-preference + L4 in-text
+BELOW/ABOVE auto-layout passes.
 
-Specs FS-1..FS-3 per Goal-3 plan §2 (G3-M5a). L4 (in-text BELOW/ABOVE
-fallback) is deferred to G3-M5b and intentionally NOT exercised here:
-FS-2 asserts that "no L2 fit → nil" so the badge fallback engages until
-M5b adds the second tier.
+Specs FS-1..FS-3 per Goal-3 plan §2 (G3-M5a) — L2 margin pass.
+Specs FS-4..FS-6 per Goal-3 plan §2 (G3-M5b) — L4 in-text fallback.
+
+FS-2 now blocks every L4 candidate too (wide cluster on full-screen
+text), so "no fit anywhere → nil" still holds after M5b wires L4.
 
 Run with: busted spec/free_spot_spec.lua
 
@@ -46,13 +48,16 @@ describe("FreeSpot.find_free_spot (L2 margin pass)", function()
         assert.are.equal(1.0, result.scale)        -- best (largest) scale
     end)
 
-    it("G3-FS-2: cluster does not fit in either margin → nil (L4 not yet wired)", function()
-        -- Wide cluster + full-width text → every L2 candidate collides
-        -- regardless of scale (even at the 0.5 floor).
+    it("G3-FS-2: cluster does not fit in either margin → nil (L2 boundary)", function()
+        -- Wide cluster + full-screen text → every L2 candidate AND every
+        -- L4 candidate (BELOW/ABOVE) collides regardless of scale.
+        -- This single fixture proves the M5a→M5b transition: in M5a it
+        -- returned nil because L4 was unwired; in M5b it returns nil
+        -- because both passes exhaust without a non-colliding placement.
         local cluster_bbox = { x = 100, y = 200, w = 300, h = 30 }
         local anchor_bbox  = { x = 100, y = 200, w = 200, h = 16 }
         local text_line_bboxes = {
-            { x = 0, y = 200, w = 500, h = 30 },  -- spans full screen width
+            { x = 0, y = 0, w = 500, h = 800 },  -- text fills the whole screen
         }
         local other_annotation_bboxes = {}
         local screen_bounds = { x = 0, y = 0, w = 500, h = 800 }
@@ -87,6 +92,82 @@ describe("FreeSpot.find_free_spot (L2 margin pass)", function()
         -- right margin placement: x = screen_w - scaled_w
         assert.are.equal(500 - 80 * 0.75, result.x)  -- 440
         assert.are.equal(anchor_bbox.y, result.y)
+    end)
+
+end)
+
+describe("FreeSpot.find_free_spot (L4 in-text BELOW/ABOVE fallback)", function()
+
+    it("G3-FS-4: L4 finds BELOW position when L2 margins are exhausted", function()
+        -- Anchor on a full-width text line so both margin strips collide
+        -- at every scale (L2 exhausted). Region BELOW the anchor line is
+        -- free, so L4 BELOW finds a fit at scale 1.0:
+        --   candidate.y = anchor.y + anchor.h + MARGIN = 200 + 16 + 24 = 240
+        --   candidate.x = anchor.x = 50
+        local cluster_bbox = { x = 100, y = 200, w = 80, h = 30 }
+        local anchor_bbox  = { x = 50,  y = 200, w = 200, h = 16 }
+        local text_line_bboxes = {
+            -- Anchor text line spans full screen width → L2 fully blocked
+            { x = 0, y = 200, w = 500, h = 16 },
+            -- No text in the BELOW region (anchor_y + anchor_h + padding
+            -- onwards).
+        }
+        local other_annotation_bboxes = {}
+        local screen_bounds = { x = 0, y = 0, w = 500, h = 800 }
+
+        local result = FreeSpot.find_free_spot(
+            cluster_bbox, anchor_bbox,
+            text_line_bboxes, other_annotation_bboxes, screen_bounds)
+
+        assert.is_table(result)
+        assert.are.equal(1.0, result.scale)
+        assert.are.equal(anchor_bbox.x, result.x)                       -- 50
+        assert.are.equal(anchor_bbox.y + anchor_bbox.h + MARGIN, result.y)  -- 240
+    end)
+
+    it("G3-FS-5: L4 finds ABOVE position when BELOW is blocked", function()
+        -- Anchor on full-width text (L2 blocked), AND text fills the
+        -- BELOW region (L4-below blocked), but the region ABOVE the
+        -- anchor is free → L4 ABOVE returns:
+        --   candidate.y = anchor.y - cluster.h * scale - MARGIN
+        --              = 400 - 30 * 1.0 - 24 = 346
+        --   candidate.x = anchor.x = 50
+        local cluster_bbox = { x = 100, y = 400, w = 80, h = 30 }
+        local anchor_bbox  = { x = 50,  y = 400, w = 200, h = 16 }
+        local text_line_bboxes = {
+            { x = 0, y = 400, w = 500, h = 16 },   -- anchor line full-width
+            { x = 0, y = 440, w = 500, h = 360 },  -- below region full-blocked
+        }
+        local other_annotation_bboxes = {}
+        local screen_bounds = { x = 0, y = 0, w = 500, h = 800 }
+
+        local result = FreeSpot.find_free_spot(
+            cluster_bbox, anchor_bbox,
+            text_line_bboxes, other_annotation_bboxes, screen_bounds)
+
+        assert.is_table(result)
+        assert.are.equal(1.0, result.scale)
+        assert.are.equal(anchor_bbox.x, result.x)  -- 50
+        assert.are.equal(anchor_bbox.y - cluster_bbox.h * 1.0 - MARGIN, result.y)  -- 346
+    end)
+
+    it("G3-FS-6: L4 returns nil when both BELOW and ABOVE are blocked", function()
+        -- Text fills the entire screen → no candidate (L2 margin or L4
+        -- in-text) can possibly fit at any scale. find_free_spot must
+        -- return nil so the rotation-badge EARNED path engages.
+        local cluster_bbox = { x = 100, y = 400, w = 80, h = 30 }
+        local anchor_bbox  = { x = 50,  y = 400, w = 200, h = 16 }
+        local text_line_bboxes = {
+            { x = 0, y = 0, w = 500, h = 800 },  -- text fills screen
+        }
+        local other_annotation_bboxes = {}
+        local screen_bounds = { x = 0, y = 0, w = 500, h = 800 }
+
+        local result = FreeSpot.find_free_spot(
+            cluster_bbox, anchor_bbox,
+            text_line_bboxes, other_annotation_bboxes, screen_bounds)
+
+        assert.is_nil(result)
     end)
 
 end)
