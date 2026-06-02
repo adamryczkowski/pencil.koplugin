@@ -248,41 +248,48 @@ Not blocking the current release, but worth recording:
    of accidentally orphaning slow-thinking users. Trade-off,
    not a fix.
 
-7. **Exclamation hue from lib emit**. The G3-M8.5 executor
-   `Pencil:_drawAnchorExclamation` (`main.lua`) hardcodes the
-   indigo `{75, 0, 130}` hue because
-   `lib/stroke_paint.lua`'s `paint_anchor_group` does not
-   currently populate `op.hue` for `exclamation` ops (it does
-   populate `op.hue` for `highlight_underline` and `connector`
-   ops). The migration is two changes:
-   - Extend `paint_anchor_group` (in `lib/stroke_paint.lua`) to
-     emit `hue = AnchorConstants.ANCHOR_UNDERLINE_HUE` on the
-     exclamation op (single visual family — same indigo as the
-     underline + connector — per
-     [§6.3](06-explicit-anchoring.md#63-anchor-highlight--connector-g3-3)).
-   - Strip the hardcoded `{75, 0, 130}` from
-     `Pencil:_drawAnchorExclamation` and consume the new
-     `op.hue` field instead.
-   Currently hardcoded because the M8.5 scope was bounded to
-   wire the dispatch, not to extend the lib emit shape.
+7. **Exclamation hue from lib emit.** **Landed in G3-M9 (SHA
+   `7d9325b`).** `lib/stroke_paint.lua` `paint_anchor_group`
+   emits `hue = AnchorConstants.ANCHOR_UNDERLINE_HUE` on the
+   exclamation op (single visual family with the underline +
+   connector). The 3 main.lua paint helpers
+   (`_drawAnchorUnderline`, `_drawConnector`,
+   `_drawAnchorExclamation`) consume `op.hue` with an
+   `AnchorConstants.ANCHOR_UNDERLINE_HUE` / `CONNECTOR_HUE`
+   defensive fallback. Hardcoded `{75, 0, 130}` literals are
+   eliminated; hard-constraint #5 (no inline color literals at
+   paint sites) is fully enforced. Integration-spec-covered by
+   `spec/stroke_paint_anchor_spec.lua` G3-M9-HUE-1.
 
-8. **Pulse animation in exclamation glyph**. The G3-M8.5
-   executor `Pencil:_drawAnchorExclamation` accepts a `pulse`
-   argument (emitted by `paint_anchor_group` as
-   `op.pulse = false` for the steady-state exclamation, per
-   `EXCLAMATION_PULSE_DURATION_MS = 300 ms` in
-   `lib/anchor_constants.lua`) but the executor currently
-   renders only the static glyph — the `pulse` flag is
-   accepted and discarded. Animating the one-shot first-paint
-   pulse means scheduling a `UIManager:scheduleIn(0.3, …)` from
-   the executor when `pulse == true` and triggering a
-   repaint at the end. The animation is a follow-up because:
-   - `UIManager:scheduleIn` from inside a paint pass adds an
-     execution-order subtlety (the schedule fires AFTER the
-     current paint completes, so the pulse must be encoded as
-     a state field on the group that the next paint reads).
-   - The static glyph is functionally complete as a manual-
-     anchor prompt; the pulse is a polish item.
-   Currently a no-op because UIManager scheduling from inside
-   the paint pass was deferred from M8.5 to keep the scope
-   bounded to the dispatch wiring.
+8. **Pulse animation in exclamation glyph.** **Landed in G3-M9
+   (SHA `7d9325b`).** `Pencil:_drawAnchorExclamation` schedules a
+   one-shot first-paint pulse via
+   `UIManager:scheduleIn(EXCLAMATION_PULSE_DURATION_MS / 1000,
+   ...)` (300 ms — one e-ink full-refresh cycle plus settle, per
+   `lib/anchor_constants.lua`). The scheduled callback calls
+   `UIManager:setDirty(..., "ui")` to trigger a single re-render,
+   completing one pulse cycle. Guarded by
+   `self._exclamation_pulse_scheduled` so the scheduler does NOT
+   re-fire on every paint (one-shot per Pencil instance).
+   pcall-wrapped on every UIManager boundary so a missing method
+   yields a silent no-op (build-compat idiom). Integration-spec-
+   covered by `spec/g3_wiring_spec.lua` G3-M9-PULSE-1 (source-
+   grep verifies the helper references `scheduleIn`,
+   `EXCLAMATION_PULSE_DURATION_MS`, and the
+   `_exclamation_pulse_scheduled` flag; behavioural mirror
+   asserts one-shot semantics across `pulse=true` / `pulse=true`
+   / `pulse=false` sequences).
+
+9. **Pulse setDirty scope (future optimization).**
+   `_drawAnchorExclamation` currently calls
+   `UIManager:setDirty(..., "ui")` for the pulse repaint, which
+   triggers a full-widget refresh. This is the conservative
+   correct choice — the e-ink driver handles the refresh — but
+   could be scope-narrowed to the cluster bbox (`refresh region
+   = exclamation glyph rect` or `cluster_bbox + small margin`)
+   for a cheaper repaint cycle. The optimization is not
+   blocking: the full-refresh latency is dominated by the 300 ms
+   pulse interval itself, not by the refresh area, and
+   over-refreshing is visually correct. A future feature could
+   propagate the cluster_bbox through to the scheduled callback
+   and pass it as the refresh region.
