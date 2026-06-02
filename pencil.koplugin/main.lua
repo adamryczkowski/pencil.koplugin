@@ -24,6 +24,7 @@ local SettingsDefaults = require("lib/settings_defaults")
 local StrokeCapture = require("lib/stroke_capture")
 local StrokeCluster = require("lib/stroke_cluster")
 local StrokePaint = require("lib/stroke_paint")
+local PdfAnchor = require("lib/pdf_anchor")
 local Screen = Device.screen
 local Size = require("ui/size")
 local InfoMessage = require("ui/widget/infomessage")
@@ -3867,6 +3868,74 @@ function Pencil:getGroupColor(group)
     return nil
 end
 
+-- G3-M8.5 anchor primitives. These three helpers execute the visual
+-- render ops emitted by lib/stroke_paint.lua paint_anchor_group for
+-- "explicit" anchor groups (highlight_underline, connector,
+-- exclamation). Patterns adapted from drawLineSegment (line stamping
+-- via paintRectRGB32 — Blitbuffer has no native line primitive) and
+-- renderRotationBadge (rect-composition glyph rendering — no font
+-- dependency). Constants for color / size / alpha come from
+-- lib/anchor_constants.lua and reach these helpers via op.hue,
+-- op.alpha, op.height_px, op.width_px from paint_anchor_group.
+
+-- Anchor underline: thin horizontal rect at the resolved text line.
+function Pencil:_drawAnchorUnderline(bb, x, y, w, height_px, alpha, hue)
+    if not bb or not x or not y or not w or w <= 0 then return end
+    local h = height_px or 2
+    local a = alpha or 255
+    local r, g, b = 75, 0, 130  -- indigo fallback if hue missing
+    if type(hue) == "table" then
+        r = hue.r or r
+        g = hue.g or g
+        b = hue.b or b
+    end
+    local color = Blitbuffer.ColorRGB32(r, g, b, a)
+    bb:paintRectRGB32(math.floor(x), math.floor(y),
+        math.floor(w), math.floor(h), color)
+end
+
+-- Connector line: same step-by-rect technique as drawLineSegment so
+-- the connector renders consistently with the rest of the plugin's
+-- line primitives. Width 2 by default; alpha and hue from op fields.
+function Pencil:_drawConnector(bb, x0, y0, x1, y1, width_px, alpha, hue)
+    if not bb or not x0 or not y0 or not x1 or not y1 then return end
+    local w = width_px or 2
+    local a = alpha or 255
+    local r, g, b = 75, 0, 130
+    if type(hue) == "table" then
+        r = hue.r or r
+        g = hue.g or g
+        b = hue.b or b
+    end
+    local color = Blitbuffer.ColorRGB32(r, g, b, a)
+    self:drawLineSegment(bb, x0, y0, x1, y1, w, color)
+end
+
+-- Exclamation glyph: indigo "!" composed of a vertical bar + dot
+-- (rect-composition, no font dependency — matches
+-- renderRotationBadge's glyph technique). The pulse arg is the
+-- first-touch animation hint emitted by paint_anchor_group; for
+-- M8.5 the static glyph is the deliverable. A single-pulse e-ink
+-- animation (EXCLAMATION_PULSE_DURATION_MS, lib/anchor_constants.lua)
+-- is a follow-up — the static "!" is fully functional as a
+-- manual-anchor prompt.
+function Pencil:_drawAnchorExclamation(bb, x, y, size_px, alpha, pulse)
+    if not bb or not x or not y or not size_px or size_px <= 0 then
+        return
+    end
+    local a = alpha or 204
+    local color = Blitbuffer.ColorRGB32(75, 0, 130, a)  -- indigo
+    local bar_w = math.max(2, math.floor(size_px / 5))
+    local bar_h = math.floor(size_px * 0.7)
+    local dot_h = math.max(2, math.floor(size_px * 0.15))
+    local gap   = math.max(1, math.floor(size_px * 0.1))
+    local ix, iy = math.floor(x), math.floor(y)
+    bb:paintRectRGB32(ix, iy, bar_w, bar_h, color)
+    bb:paintRectRGB32(ix, iy + bar_h + gap, bar_w, dot_h, color)
+    -- pulse: single-pulse animation hint; static glyph for M8.5.
+    local _ = pulse
+end
+
 function Pencil:renderRotationBadge(bb, group)
     local rect = self:getGroupBadgeRect(group)
     if not rect then return end
@@ -4382,26 +4451,35 @@ function Pencil:paintTo(bb, x, y)
     for _, group in ipairs(self.annotation_groups) do
         local gpage = self:getGroupCurrentPage(group)
         if gpage == page then
-            groups_on_page = groups_on_page + 1
-            if group.image_path then
-                groups_with_image = groups_with_image + 1
-            end
-            if group.image_rotation == nil
-                    or group.image_rotation == current_rot then
-                -- Renders natively (same rotation as capture, or legacy group
-                -- without rotation info — render strokes as-is).
-                has_native_annotation = true
-            elseif group.anchor then
-                -- Goal-2: has a line-relative anchor; the anchor pass below
-                -- will render it (translate, silent-clip, or fallback to
-                -- badge via StrokePaint). Skip the stale-badge bookkeeping
-                -- — otherwise the stale-check blocks the anchor pass.
-            elseif group.image_path then
-                stale_groups = stale_groups or {}
-                stale_groups[#stale_groups + 1] = group
-                stale_indices = stale_indices or {}
-                for _, idx in ipairs(group.stroke_indices or {}) do
-                    stale_indices[idx] = true
+            -- M8.5 G3 type-guard: explicit/pdf_page anchors handle their
+            -- own rotation/page state (paint_anchor_group emits the right
+            -- ops, pdf_anchor.should_render gates the page); bypass the
+            -- Goal-2 stale-rotation filter entirely.
+            local g3_typed = group.anchor
+                and (group.anchor.type == "explicit"
+                  or group.anchor.type == "pdf_page")
+            if not g3_typed then
+                groups_on_page = groups_on_page + 1
+                if group.image_path then
+                    groups_with_image = groups_with_image + 1
+                end
+                if group.image_rotation == nil
+                        or group.image_rotation == current_rot then
+                    -- Renders natively (same rotation as capture, or legacy group
+                    -- without rotation info — render strokes as-is).
+                    has_native_annotation = true
+                elseif group.anchor then
+                    -- Goal-2: has a line-relative anchor; the anchor pass below
+                    -- will render it (translate, silent-clip, or fallback to
+                    -- badge via StrokePaint). Skip the stale-badge bookkeeping
+                    -- — otherwise the stale-check blocks the anchor pass.
+                elseif group.image_path then
+                    stale_groups = stale_groups or {}
+                    stale_groups[#stale_groups + 1] = group
+                    stale_indices = stale_indices or {}
+                    for _, idx in ipairs(group.stroke_indices or {}) do
+                        stale_indices[idx] = true
+                    end
                 end
             end
         end
@@ -4454,16 +4532,87 @@ function Pencil:paintTo(bb, x, y)
         for _, group in ipairs(self.annotation_groups) do
             if group.anchor
                     and self:getGroupCurrentPage(group) == page then
-                -- Derive em / lh from the actual on-screen line box of
-                -- the anchor's xpointer, so paint-time scaling matches
-                -- capture-time scaling regardless of font size / rotation.
-                -- Falls back to the prior heuristic if the query fails.
-                local em_px, lh_px = self:_getAnchorMetrics(group.anchor.xp)
-                StrokePaint.paint_with_anchor(group, self.ui.document,
-                    em_px, lh_px, draw_translated_fn, rotation_badge_fn)
-                anchor_owned = anchor_owned or {}
-                for _, idx in ipairs(group.stroke_indices or {}) do
-                    anchor_owned[idx] = true
+                -- M8.5 G3 4-branch dispatch on group.anchor.type:
+                --   nil   → never enters this loop (gated above)
+                --   line  → existing paint_with_anchor — BYTE-IDENTICAL
+                --           earned path from G3-M7 (preserved below)
+                --   explicit / pdf_page → Goal-3 paint_anchor_group path
+                local atype = group.anchor.type
+                if atype == "explicit" or atype == "pdf_page" then
+                    -- Goal-3 dispatch. pdf_page is additionally gated by
+                    -- PdfAnchor.should_render so the group only renders
+                    -- on its captured page (defensive — outer
+                    -- getGroupCurrentPage already filters this for
+                    -- typical groups, but should_render is the explicit
+                    -- type contract).
+                    --
+                    -- Nil guard: pdf_page anchors have anchor.xp == nil
+                    -- per schema (PDF has no xpointer); only the
+                    -- explicit branch needs anchor metrics, and only
+                    -- the explicit branch's underline/connector ops
+                    -- consume lh_px. Defaults of (12, 20) match
+                    -- paint_anchor_group's own fallback so the
+                    -- exclamation glyph (the only lh_px consumer in
+                    -- the executor below) scales sanely if a future
+                    -- code path emits one for pdf_page.
+                    local em_px, lh_px = 12, 20
+                    if atype == "explicit" then
+                        em_px, lh_px = self:_getAnchorMetrics(group.anchor.xp)
+                    end
+                    local should_paint = true
+                    if atype == "pdf_page"
+                            and not PdfAnchor.should_render(group, page) then
+                        should_paint = false
+                    end
+                    if should_paint then
+                        local ok, ops = pcall(StrokePaint.paint_anchor_group,
+                            group, self.ui.document,
+                            em_px, lh_px,
+                            Screen:getWidth(), Screen:getHeight(),
+                            Screen:getRotationMode() or 0,
+                            draw_translated_fn, rotation_badge_fn,
+                            nil, nil)
+                        if ok and ops then
+                            for _, op in ipairs(ops) do
+                                if op.type == "stroke" then
+                                    self:_drawStrokeTranslated(
+                                        group, op.dx, op.dy, op.scale)
+                                elseif op.type == "badge" then
+                                    self:_rotationBadgeRender(group)
+                                elseif op.type == "highlight_underline" then
+                                    self:_drawAnchorUnderline(bb,
+                                        op.x, op.y, op.w,
+                                        op.height_px, op.alpha, op.hue)
+                                elseif op.type == "connector" then
+                                    self:_drawConnector(bb,
+                                        op.x0, op.y0, op.x1, op.y1,
+                                        op.width_px, op.alpha, op.hue)
+                                elseif op.type == "exclamation" then
+                                    self:_drawAnchorExclamation(bb,
+                                        op.x, op.y,
+                                        (op.size_lh or 1.5) * lh_px,
+                                        op.alpha, op.pulse)
+                                end
+                            end
+                        end
+                    end
+                    anchor_owned = anchor_owned or {}
+                    for _, idx in ipairs(group.stroke_indices or {}) do
+                        anchor_owned[idx] = true
+                    end
+                else
+                    -- nil / "line" — BYTE-IDENTICAL earned path from G3-M7.
+                    -- Derive em / lh from the actual on-screen line box of
+                    -- the anchor's xpointer, so paint-time scaling matches
+                    -- capture-time scaling regardless of font size / rotation.
+                    -- Falls back to the prior heuristic if the query fails.
+                    local em_px, lh_px = self:_getAnchorMetrics(group.anchor.xp)
+                    StrokePaint.paint_with_anchor(group, self.ui.document,
+                        em_px, lh_px, draw_translated_fn, rotation_badge_fn)
+                    anchor_owned = anchor_owned or {}
+                    for _, idx in ipairs(group.stroke_indices or {}) do
+                        anchor_owned[idx] = true
+                    end
                 end
             end
         end
