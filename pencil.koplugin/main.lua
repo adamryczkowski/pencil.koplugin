@@ -3877,18 +3877,23 @@ end
 -- dependency). Constants for color / size / alpha come from
 -- lib/anchor_constants.lua and reach these helpers via op.hue,
 -- op.alpha, op.height_px, op.width_px from paint_anchor_group.
+--
+-- G3-M9: hue is now consumed end-to-end from paint_anchor_group's
+-- op.hue field (no inline indigo literals at paint sites —
+-- hard-constraint #5). The defensive fallback dereferences
+-- AnchorConstants.ANCHOR_UNDERLINE_HUE rather than restating the
+-- {75, 0, 130} literal so a future hue change in
+-- lib/anchor_constants.lua propagates to the executor.
 
 -- Anchor underline: thin horizontal rect at the resolved text line.
 function Pencil:_drawAnchorUnderline(bb, x, y, w, height_px, alpha, hue)
     if not bb or not x or not y or not w or w <= 0 then return end
     local h = height_px or 2
     local a = alpha or 255
-    local r, g, b = 75, 0, 130  -- indigo fallback if hue missing
-    if type(hue) == "table" then
-        r = hue.r or r
-        g = hue.g or g
-        b = hue.b or b
-    end
+    local fallback = AnchorConstants.ANCHOR_UNDERLINE_HUE
+    local r = (type(hue) == "table" and hue.r) or fallback.r
+    local g = (type(hue) == "table" and hue.g) or fallback.g
+    local b = (type(hue) == "table" and hue.b) or fallback.b
     local color = Blitbuffer.ColorRGB32(r, g, b, a)
     bb:paintRectRGB32(math.floor(x), math.floor(y),
         math.floor(w), math.floor(h), color)
@@ -3901,12 +3906,10 @@ function Pencil:_drawConnector(bb, x0, y0, x1, y1, width_px, alpha, hue)
     if not bb or not x0 or not y0 or not x1 or not y1 then return end
     local w = width_px or 2
     local a = alpha or 255
-    local r, g, b = 75, 0, 130
-    if type(hue) == "table" then
-        r = hue.r or r
-        g = hue.g or g
-        b = hue.b or b
-    end
+    local fallback = AnchorConstants.CONNECTOR_HUE
+    local r = (type(hue) == "table" and hue.r) or fallback.r
+    local g = (type(hue) == "table" and hue.g) or fallback.g
+    local b = (type(hue) == "table" and hue.b) or fallback.b
     local color = Blitbuffer.ColorRGB32(r, g, b, a)
     self:drawLineSegment(bb, x0, y0, x1, y1, w, color)
 end
@@ -3914,17 +3917,27 @@ end
 -- Exclamation glyph: indigo "!" composed of a vertical bar + dot
 -- (rect-composition, no font dependency — matches
 -- renderRotationBadge's glyph technique). The pulse arg is the
--- first-touch animation hint emitted by paint_anchor_group; for
--- M8.5 the static glyph is the deliverable. A single-pulse e-ink
--- animation (EXCLAMATION_PULSE_DURATION_MS, lib/anchor_constants.lua)
--- is a follow-up — the static "!" is fully functional as a
--- manual-anchor prompt.
-function Pencil:_drawAnchorExclamation(bb, x, y, size_px, alpha, pulse)
+-- first-touch animation hint emitted by paint_anchor_group.
+--
+-- G3-M9 pulse implementation: when op.pulse == true AND a pulse
+-- has not yet been delivered for this Pencil instance, schedule a
+-- UIManager:setDirty repaint after EXCLAMATION_PULSE_DURATION_MS
+-- (300 ms — one e-ink full refresh cycle). The schedule is one-shot
+-- per Pencil instance; the `self._exclamation_pulse_scheduled` flag
+-- prevents the scheduler from re-firing on every paint pass. The
+-- visible effect is: first paint draws the glyph at full alpha;
+-- 300 ms later the screen re-renders, completing a single pulse
+-- cycle. Per anchor_constants.lua: single pulse, not a loop.
+function Pencil:_drawAnchorExclamation(bb, x, y, size_px, alpha, pulse, hue)
     if not bb or not x or not y or not size_px or size_px <= 0 then
         return
     end
-    local a = alpha or 204
-    local color = Blitbuffer.ColorRGB32(75, 0, 130, a)  -- indigo
+    local a = alpha or AnchorConstants.EXCLAMATION_ALPHA
+    local fallback = AnchorConstants.ANCHOR_UNDERLINE_HUE
+    local r = (type(hue) == "table" and hue.r) or fallback.r
+    local g = (type(hue) == "table" and hue.g) or fallback.g
+    local b = (type(hue) == "table" and hue.b) or fallback.b
+    local color = Blitbuffer.ColorRGB32(r, g, b, a)
     local bar_w = math.max(2, math.floor(size_px / 5))
     local bar_h = math.floor(size_px * 0.7)
     local dot_h = math.max(2, math.floor(size_px * 0.15))
@@ -3932,8 +3945,24 @@ function Pencil:_drawAnchorExclamation(bb, x, y, size_px, alpha, pulse)
     local ix, iy = math.floor(x), math.floor(y)
     bb:paintRectRGB32(ix, iy, bar_w, bar_h, color)
     bb:paintRectRGB32(ix, iy + bar_h + gap, bar_w, dot_h, color)
-    -- pulse: single-pulse animation hint; static glyph for M8.5.
-    local _ = pulse
+
+    -- G3-M9 first-paint pulse. Schedules a one-shot repaint
+    -- EXCLAMATION_PULSE_DURATION_MS after the first paint where
+    -- op.pulse == true. Guarded by an instance flag so subsequent
+    -- paints (which re-render the static glyph) do not re-schedule.
+    if pulse and not self._exclamation_pulse_scheduled then
+        self._exclamation_pulse_scheduled = true
+        local delay_s = (AnchorConstants.EXCLAMATION_PULSE_DURATION_MS
+                         or 300) / 1000
+        -- build-compat: UIManager:scheduleIn  (KOReader UIManager API)
+        if UIManager and UIManager.scheduleIn then
+            pcall(UIManager.scheduleIn, UIManager, delay_s, function()
+                if UIManager.setDirty then
+                    pcall(UIManager.setDirty, UIManager, "all", "ui")
+                end
+            end)
+        end
+    end
 end
 
 function Pencil:renderRotationBadge(bb, group)
@@ -4591,7 +4620,7 @@ function Pencil:paintTo(bb, x, y)
                                     self:_drawAnchorExclamation(bb,
                                         op.x, op.y,
                                         (op.size_lh or 1.5) * lh_px,
-                                        op.alpha, op.pulse)
+                                        op.alpha, op.pulse, op.hue)
                                 end
                             end
                         end

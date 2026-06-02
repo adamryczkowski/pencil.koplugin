@@ -171,6 +171,27 @@ describe("StrokePaint.paint_anchor_group", function()
         assert.is_true(i_stroke < i_exc)
     end)
 
+    it("G3-M9-HUE-1: exclamation op carries hue field (ANCHOR_UNDERLINE_HUE — single visual family)", function()
+        -- G3-M9: paint_anchor_group emits op.hue for the exclamation
+        -- branch so the paintTo executor can drop its hardcoded
+        -- {75, 0, 130} fallback (hard-constraint #5 — no inline color
+        -- literals at paint sites). The exclamation hue MUST match
+        -- ANCHOR_UNDERLINE_HUE so the underline + connector +
+        -- exclamation render as one visual family.
+        local AnchorConstants = require("lib/anchor_constants")
+        local doc = make_doc({ screen_y = 350, screen_x = 50 })
+        local group = { anchor = EXPLICIT_AMBIGUOUS, stroke_indices = { 1 } }
+        local dt, rb, ah, cn = bundle()
+        local ops = StrokePaint.paint_anchor_group(
+            group, doc, 12, 20, 800, 600, 0, dt, rb, ah, cn)
+        local _, exc = find_op(ops, "exclamation")
+        assert.is_not_nil(exc)
+        assert.is_table(exc.hue)
+        assert.are.equal(AnchorConstants.ANCHOR_UNDERLINE_HUE.r, exc.hue.r)
+        assert.are.equal(AnchorConstants.ANCHOR_UNDERLINE_HUE.g, exc.hue.g)
+        assert.are.equal(AnchorConstants.ANCHOR_UNDERLINE_HUE.b, exc.hue.b)
+    end)
+
     it("G3-PT-6: explicit-anchor group with stale rotation tag still reaches stroke draw", function()
         -- The stale-rotation filter is wired in main.lua and bypasses
         -- "explicit"/"pdf_page" groups via a type guard. paint_anchor_group

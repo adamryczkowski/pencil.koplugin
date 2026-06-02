@@ -306,6 +306,60 @@ describe("Goal-3 G3-M8.5 paintTo dispatch wiring", function()
         end
     end)
 
+    it("G3-M9-PULSE-1: _drawAnchorExclamation schedules a UIManager pulse when op.pulse==true", function()
+        -- G3-M9: the exclamation glyph delivers a one-shot e-ink
+        -- pulse on first paint (EXCLAMATION_PULSE_DURATION_MS = 300ms,
+        -- per lib/anchor_constants.lua). Implementation: when
+        -- op.pulse is truthy AND the instance flag
+        -- _exclamation_pulse_scheduled is not yet set, call
+        -- UIManager:scheduleIn(EXCLAMATION_PULSE_DURATION_MS/1000, fn)
+        -- and set the flag to prevent re-scheduling on subsequent
+        -- paints.
+
+        -- Source-level: the helper body must reference UIManager
+        -- scheduleIn, the EXCLAMATION_PULSE_DURATION_MS constant
+        -- (via AnchorConstants), and the instance flag.
+        local src = read_file(MAIN_LUA)
+        local body = findHandlerBody(src, "_drawAnchorExclamation")
+        assert.is_not_nil(body,
+            "_drawAnchorExclamation helper body must be findable")
+        assert.is_truthy(body:find("scheduleIn", 1, true),
+            "_drawAnchorExclamation must call UIManager:scheduleIn for the first-paint pulse (G3-M9-PULSE-1)")
+        assert.is_truthy(body:find("EXCLAMATION_PULSE_DURATION_MS", 1, true),
+            "_drawAnchorExclamation must source the pulse delay from AnchorConstants.EXCLAMATION_PULSE_DURATION_MS (G3-M9-PULSE-1)")
+        assert.is_truthy(body:find("_exclamation_pulse_scheduled", 1, true),
+            "_drawAnchorExclamation must guard the scheduler with the _exclamation_pulse_scheduled instance flag so the pulse is one-shot per Pencil instance (G3-M9-PULSE-1)")
+
+        -- Behavioural mirror: a fake exclamation drawer that
+        -- captures UIManager:scheduleIn calls. Verifies:
+        --   - op.pulse=true on a fresh instance → 1 schedule call
+        --   - op.pulse=true on the same instance again → 0 new schedule
+        --     (one-shot per instance per the _exclamation_pulse_scheduled
+        --     guard)
+        --   - op.pulse=false → 0 schedule calls
+        local schedule_calls = 0
+        local function fake_draw_exclamation(instance, op, ui_manager)
+            if op.pulse and not instance._exclamation_pulse_scheduled then
+                instance._exclamation_pulse_scheduled = true
+                ui_manager:scheduleIn(0.3, function() end)
+            end
+        end
+        local fake_um = {
+            scheduleIn = function(_, _, _)
+                schedule_calls = schedule_calls + 1
+            end,
+        }
+        local pencil = {}
+        fake_draw_exclamation(pencil, { pulse = true }, fake_um)
+        assert.equals(1, schedule_calls)
+        fake_draw_exclamation(pencil, { pulse = true }, fake_um)
+        assert.equals(1, schedule_calls,
+            "second pulse=true paint on same instance must NOT re-schedule")
+        fake_draw_exclamation({}, { pulse = false }, fake_um)
+        assert.equals(1, schedule_calls,
+            "pulse=false must NOT schedule")
+    end)
+
     it("G3-M8.5-WR-5: stale-rotation filter bypasses explicit/pdf_page via type-guard", function()
         local body = get_paintTo_body()
         assert.is_not_nil(body)

@@ -302,6 +302,11 @@ function StrokePaint.paint_anchor_group(group, doc,
     -- 4. exclamation — only when the cluster is still ambiguous.
     -- Per plan §1.4: static glyph at top-right of cluster bounding
     -- box. Caller animates the single first-touch pulse.
+    --
+    -- G3-M9: emit op.hue (same indigo family as underline + connector
+    -- per §6.3) so the executor can drop its hardcoded {75,0,130}
+    -- fallback. ANCHOR_UNDERLINE_HUE doubles as the exclamation hue
+    -- (single visual family).
     if group.anchor.clarified == false then
         table.insert(ops, {
             type    = "exclamation",
@@ -309,6 +314,7 @@ function StrokePaint.paint_anchor_group(group, doc,
             y       = paint_y,
             size_lh = AnchorConstants.EXCLAMATION_SIZE_LH,
             alpha   = AnchorConstants.EXCLAMATION_ALPHA,
+            hue     = AnchorConstants.ANCHOR_UNDERLINE_HUE,
             pulse   = false,
         })
     end
