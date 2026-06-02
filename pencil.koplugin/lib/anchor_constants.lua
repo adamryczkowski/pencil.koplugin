@@ -44,16 +44,20 @@ require this module rather than re-stating the literal.
     "pdf_page"     Goal-3 PDF page-anchor                lib/pdf_anchor
                    (page integer only)                   lib/stroke_paint
 
-Stale-rotation filter (main.lua:4247-4296) gains a 2-line type-guard
-in G3-M4: `"explicit"` and `"pdf_page"` groups bypass the rotation
-filter so their saved stroke geometry reaches the draw step
-unchanged. The filter remains byte-identical for `nil` and `"line"`
-(earned-path preservation, Goal-2 hard constraint).
+Stale-rotation filter (inside `paintTo`, approximately
+main.lua:4446-4491) has a 2-line type-guard at SHA 72d6920
+(G3-M8.5): `"explicit"` and `"pdf_page"` groups bypass the
+rotation filter so their saved stroke geometry reaches the draw
+step unchanged. The filter itself remains byte-identical for
+`nil` and `"line"` (earned-path preservation, Goal-2 hard
+constraint). The guard is two purely additive lines at the top of
+the filter; integration-spec-covered by spec/g3_wiring_spec.lua
+G3-M8.5-WR-5.
 
 Render-op ordering invariant (LOCKED in G3-M4)
 ----------------------------------------------
 
-    highlight_underline  <  stroke  <  exclamation  <  badge
+    highlight_underline  <  connector  <  stroke  <  exclamation  <  badge
 
 (Underline drawn first so ink sits on top; badge last so the
 fallback marker stays visible when present.)
