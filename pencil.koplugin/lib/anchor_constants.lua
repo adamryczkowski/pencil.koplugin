@@ -201,4 +201,15 @@ AnchorConstants.FREE_SPOT_HISTORY_CAP = 1
 -- lib/manual_anchor.lua (G3-M4).
 AnchorConstants.CLARIFICATION_RADIUS_LH = 5
 
+--- Eraser TAP vs DRAG motion-distance threshold, in screen pixels.
+-- Per KSQ-4 resolution: input.lua does NOT distinguish eraser TAP
+-- from DRAG at the input layer (all BTN_TOOL_RUBBER events route
+-- identically). The plugin computes the distinction here: motion
+-- distance from pen-down to pen-up ≤ this threshold ⇒ TAP (atomic
+-- group delete); > this threshold ⇒ DRAG (existing per-stroke
+-- erase along path). 10px ≈ 0.85mm at 300PPI — wider than tremor,
+-- narrower than a deliberate scribble. Source-of-truth module:
+-- lib/eraser_tap.lua (G3-M6).
+AnchorConstants.ERASE_TAP_MAX_DISTANCE_PX = 10
+
 return AnchorConstants
