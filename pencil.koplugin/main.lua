@@ -4917,20 +4917,38 @@ function Pencil:onSetPageMargins()
     self:_clearStrokeAnchorCache()
 end
 
--- Post-reflow no-op (M7-REPAINT-LAG-FIX supersedes ca0e57e).
+-- Goal-3 G3-M4: paint-memo clearer. After reflow or page-turn the
+-- per-tick line-box / xpointer-position / free-spot caches that
+-- paint_anchor_group consumes are stale and must be dropped so the
+-- next paintTo re-queries CRengine. The actual memo tables live as
+-- transient fields on the Pencil instance (created lazily by the
+-- paint pipeline in G3-M5 onward); for now we just clear the slot.
+function Pencil:_clearPaintMemos()
+    self._paint_memos = nil
+end
+
+-- Goal-3 G3-M4: page-turn helper invoked by onPageUpdate (PDF) and
+-- onUpdatePos (EPUB scroll/rolling). CRengine does NOT reflow on a
+-- page crossing — only the plugin-level page-scoped paint memos
+-- become stale — so this is a cache-only invalidation.
+function Pencil:_onPageTurn()
+    self:_clearPaintMemos()
+end
+
+-- Post-reflow paint-memo invalidation (Goal-3 G3-M4 WR-1).
 --
--- The previous fix (ca0e57e) added a UIManager:setDirty(self.view, "ui")
--- call here on the theory that the highlight layer needed an explicit
--- nudge after reflow. That was incorrect: ReaderRolling already calls
--- UIManager:setDirty(self.view.dialog, "partial") at
--- readerrolling.lua:1059 immediately after broadcasting
--- DocumentRerendered, and the actual stale-cache window is closed by
--- the pre-reflow handlers above — not here. Keeping the named handler
--- as a documented no-op so its absence doesn't surprise anyone reading
--- the M7 history; if a real post-reflow action is needed in the
--- future, this is the natural site for it.
+-- M7-REPAINT-LAG-FIX retired the ca0e57e UIManager:setDirty call
+-- here because ReaderRolling already broadcasts setDirty post-reflow
+-- (readerrolling.lua:1059). G3-M4 activates the handler for a
+-- distinct purpose: the Goal-3 paint pipeline caches free-spot
+-- placements and resolved-xpointer positions per paintTo tick;
+-- those caches are stale once CRengine has reflowed and must be
+-- invalidated here. The 5 pre-reflow handlers above continue to
+-- clear the stroke-anchor cache and the ReaderView highlight-boxes
+-- cache PRE-reflow; this post-reflow handler closes the loop for
+-- the G3 paint memos.
 function Pencil:onDocumentRerendered()
-    -- Intentionally empty. See block comment above.
+    self:_clearPaintMemos()
 end
 
 -- Handle page changes (paging mode)
@@ -4956,6 +4974,11 @@ function Pencil:onPageUpdate(pageno)
     -- still missing an image (e.g. user turned past the original page before
     -- the debounce fired).
     self:backfillMissingImages()
+    -- Goal-3 G3-M4 WR-2: cache-only invalidation of paint memos on
+    -- PDF page-turn. CRengine does not reflow here, but the
+    -- plugin-level page-scoped memos (line_boxes, free-spot map)
+    -- are page-local and stale.
+    self:_onPageTurn()
 end
 
 -- Handle position changes (rolling/scroll mode)
@@ -4974,6 +4997,9 @@ function Pencil:onUpdatePos()
     self.current_stroke = nil
     self.eraser_deleted = nil
     self:backfillMissingImages()
+    -- Goal-3 G3-M4 WR-3: cache-only invalidation of paint memos on
+    -- EPUB rolling/scroll page crossing. Same rationale as WR-2.
+    self:_onPageTurn()
 end
 
 return Pencil
